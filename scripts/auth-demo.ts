@@ -10,8 +10,9 @@
  * Commands:
  *   status     - Show current authentication status
  *   check      - Check if token is valid/expiring
+ *   login      - Perform real OAuth login via browser
+ *   logout     - Clear stored credentials
  *   refresh    - Force token refresh (requires API key)
- *   clear      - Clear stored credentials
  *   demo       - Run full demo with mock interceptor
  *   auth-key   - Authenticate using API key (from env or arg)
  *   auth-token - Authenticate using direct token (from env or arg)
@@ -20,6 +21,14 @@
 import { platform, homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { promises as fs } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { exec } from "node:child_process";
+
+// --- Configuration ---
+
+const CURSOR_WEBSITE_URL = "https://cursor.com";
+const CURSOR_API_BASE_URL = "https://api2.cursor.sh";
+const POLLING_ENDPOINT = `${CURSOR_API_BASE_URL}/auth/poll`;
 
 // --- Types ---
 
@@ -41,12 +50,67 @@ interface CredentialManager {
 }
 
 interface AuthResult {
-  isAuthenticated: boolean;
-  usingApiKeyFromEnv?: boolean;
-  usingAuthTokenFromEnv?: boolean;
+  accessToken: string;
+  refreshToken: string;
+}
+
+interface AuthParams {
+  uuid: string;
+  challenge: string;
+  verifier: string;
+  loginUrl: string;
+}
+
+interface LoginMetadata {
+  uuid: string;
+  verifier: string;
 }
 
 // --- Helper Functions ---
+
+/**
+ * Base64 URL encode a buffer (same as cursor-config/dist/auth/login.js)
+ */
+function base64URLEncode(buffer: Buffer): string {
+  return buffer
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+}
+
+/**
+ * Generate a SHA-256 hash of the input string
+ */
+function sha256(data: string): Buffer {
+  return createHash("sha256").update(data).digest();
+}
+
+/**
+ * Generate authentication parameters (PKCE flow)
+ */
+function generateAuthParams(): AuthParams {
+  // Generate a 32-byte random verifier
+  const verifierArray = randomBytes(32);
+  const verifier = base64URLEncode(verifierArray);
+
+  // Generate challenge by SHA-256 hashing the verifier
+  const challengeHash = sha256(verifier);
+  const challenge = base64URLEncode(challengeHash);
+
+  // Generate a UUID
+  const uuid = randomUUID();
+
+  // Construct the login URL
+  const loginUrl = `${CURSOR_WEBSITE_URL}/loginDeepControl?challenge=${challenge}&uuid=${uuid}&mode=login&redirectTarget=cli`;
+
+  return {
+    uuid,
+    challenge,
+    verifier,
+    loginUrl,
+  };
+}
 
 /**
  * Decode JWT payload without signature verification (for display purposes only)
@@ -101,11 +165,39 @@ function maskToken(token: string | undefined): string {
   return `${token.substring(0, 10)}...${token.substring(token.length - 10)}`;
 }
 
-// --- Credential Manager Factory ---
+/**
+ * Open a URL in the default browser
+ */
+function openBrowser(url: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const command =
+      platform() === "darwin"
+        ? `open "${url}"`
+        : platform() === "win32"
+          ? `start "" "${url}"`
+          : `xdg-open "${url}"`;
+
+    exec(command, (error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+/**
+ * Sleep for a given number of milliseconds
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// --- Credential Manager ---
 
 /**
  * FileCredentialManager - File-based credential storage
- * Used on Linux/Windows, or as fallback
  */
 class FileCredentialManager implements CredentialManager {
   private cachedAccessToken: string | null = null;
@@ -142,6 +234,10 @@ class FileCredentialManager implements CredentialManager {
     }
   }
 
+  getStoragePath(): string {
+    return this.authFilePath;
+  }
+
   private async ensureDirectoryExists(): Promise<void> {
     const dir = dirname(this.authFilePath);
     try {
@@ -171,7 +267,11 @@ class FileCredentialManager implements CredentialManager {
     apiKey?: string;
   }): Promise<void> {
     await this.ensureDirectoryExists();
-    await fs.writeFile(this.authFilePath, JSON.stringify(data, null, 2), "utf-8");
+    await fs.writeFile(
+      this.authFilePath,
+      JSON.stringify(data, null, 2),
+      "utf-8"
+    );
   }
 
   async setAuthentication(
@@ -254,17 +354,155 @@ class FileCredentialManager implements CredentialManager {
 /**
  * Create appropriate credential manager for the current platform
  */
-function createCredentialManager(domain: string): CredentialManager {
-  // For this demo, we use FileCredentialManager on all platforms
-  // In production, macOS would use KeychainCredentialManager
+function createCredentialManager(domain: string): FileCredentialManager {
   console.log(`[CredentialManager] Platform: ${platform()}`);
-  console.log(
-    `[CredentialManager] Using FileCredentialManager for demo (domain: ${domain})`
-  );
+  console.log(`[CredentialManager] Domain: ${domain}`);
   return new FileCredentialManager(domain);
 }
 
-// --- Auth Refresh Logic (from restored/src/auth-refresh.ts) ---
+// --- LoginManager (from cursor-config/dist/auth/login.js) ---
+
+class LoginManager {
+  /**
+   * Start the OAuth login flow
+   * Returns metadata needed for polling and the URL to open in browser
+   */
+  startLogin(): { metadata: LoginMetadata; loginUrl: string } {
+    const authParams = generateAuthParams();
+    return {
+      metadata: {
+        uuid: authParams.uuid,
+        verifier: authParams.verifier,
+      },
+      loginUrl: authParams.loginUrl,
+    };
+  }
+
+  /**
+   * Poll for authentication result
+   * This waits for the user to complete the browser login
+   */
+  async waitForResult(metadata: LoginMetadata): Promise<AuthResult | null> {
+    const maxAttempts = 150; // Maximum number of attempts
+    const baseDelay = 1000; // 1 second base delay
+    const maxDelay = 10000; // 10 seconds maximum delay
+    const backoffMultiplier = 1.2; // Gentle exponential backoff
+    const maxConsecutiveErrors = 3;
+
+    let consecutiveErrors = 0;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const url = `${POLLING_ENDPOINT}?uuid=${metadata.uuid}&verifier=${metadata.verifier}`;
+        const response = await fetch(url, {
+          headers: {
+            "Content-Type": "application/json",
+          },
+        });
+
+        // 404 means authentication is still pending
+        if (response.status === 404) {
+          consecutiveErrors = 0;
+          const delay = Math.min(
+            baseDelay * Math.pow(backoffMultiplier, attempt),
+            maxDelay
+          );
+          process.stdout.write(".");
+          await sleep(delay);
+          continue;
+        }
+
+        // Check for other error statuses
+        if (!response.ok) {
+          consecutiveErrors++;
+          if (consecutiveErrors >= maxConsecutiveErrors) {
+            console.log("\nToo many errors, stopping.");
+            return null;
+          }
+          const delay = Math.min(
+            baseDelay * Math.pow(backoffMultiplier, attempt),
+            maxDelay
+          );
+          await sleep(delay);
+          continue;
+        }
+
+        // Success case
+        consecutiveErrors = 0;
+        const authResult = await response.json();
+
+        if (
+          typeof authResult === "object" &&
+          authResult !== null &&
+          "accessToken" in authResult &&
+          "refreshToken" in authResult
+        ) {
+          console.log("\n");
+          return authResult as AuthResult;
+        }
+
+        return null;
+      } catch {
+        consecutiveErrors++;
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          console.log("\nNetwork error, stopping.");
+          return null;
+        }
+        const delay = Math.min(
+          baseDelay * Math.pow(backoffMultiplier, attempt),
+          maxDelay
+        );
+        await sleep(delay);
+      }
+    }
+
+    console.log("\nTimeout waiting for authentication.");
+    return null;
+  }
+
+  /**
+   * Exchange API key for access/refresh tokens
+   */
+  async loginWithApiKey(
+    apiKey: string,
+    options?: { endpoint?: string }
+  ): Promise<AuthResult | null> {
+    const baseUrl = options?.endpoint ?? CURSOR_API_BASE_URL;
+
+    try {
+      const response = await fetch(`${baseUrl}/auth/exchange_user_api_key`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({}),
+      });
+
+      if (!response.ok) {
+        console.log(`API key exchange failed: ${response.status}`);
+        return null;
+      }
+
+      const authResult = await response.json();
+
+      if (
+        typeof authResult === "object" &&
+        authResult !== null &&
+        "accessToken" in authResult &&
+        "refreshToken" in authResult
+      ) {
+        return authResult as AuthResult;
+      }
+    } catch (error) {
+      console.log(`API key exchange error: ${error}`);
+    }
+
+    return null;
+  }
+}
+
+// --- Auth Refresh Logic ---
 
 async function getValidAccessToken(
   credentialManager: CredentialManager,
@@ -282,62 +520,26 @@ async function getValidAccessToken(
   // Token is expiring soon, try to refresh with API key
   const apiKey = await credentialManager.getApiKey();
   if (apiKey) {
-    console.log("[Auth] Token expiring soon, attempting refresh with API key...");
-    // In real implementation, this would call LoginManager.loginWithApiKey()
-    // For demo purposes, we just log and return the current token
-    console.log("[Auth] (Demo mode: refresh would happen here via LoginManager)");
+    console.log(
+      "[Auth] Token expiring soon, attempting refresh with API key..."
+    );
+    const loginManager = new LoginManager();
+    const result = await loginManager.loginWithApiKey(apiKey, { endpoint });
+    if (result) {
+      await credentialManager.setAuthentication(
+        result.accessToken,
+        result.refreshToken,
+        apiKey
+      );
+      console.log("[Auth] Token refreshed successfully.");
+      return result.accessToken;
+    }
   }
 
   return currentToken;
 }
 
-// --- API Key Auth Logic (from restored/src/api-key-auth.ts) ---
-
-async function tryApiKeyAuth(
-  credentialManager: CredentialManager,
-  options: { apiKey?: string; endpoint: string }
-): Promise<AuthResult> {
-  const apiKey = options.apiKey ?? process.env.CURSOR_API_KEY;
-  const usingApiKeyFromEnv = !options.apiKey && !!process.env.CURSOR_API_KEY;
-
-  if (!apiKey) {
-    return { isAuthenticated: false, usingApiKeyFromEnv: false };
-  }
-
-  console.log(
-    `[Auth] Attempting API key authentication${usingApiKeyFromEnv ? " (from CURSOR_API_KEY env)" : ""}...`
-  );
-
-  // In real implementation, this would call LoginManager.loginWithApiKey()
-  // For demo, we simulate success
-  console.log("[Auth] (Demo mode: API key validation would happen here)");
-
-  return { isAuthenticated: true, usingApiKeyFromEnv };
-}
-
-async function tryAuthTokenAuth(
-  credentialManager: CredentialManager,
-  options: { authToken?: string }
-): Promise<AuthResult> {
-  const authToken = options.authToken ?? process.env.CURSOR_AUTH_TOKEN;
-  const usingAuthTokenFromEnv =
-    !options.authToken && !!process.env.CURSOR_AUTH_TOKEN;
-
-  if (!authToken) {
-    return { isAuthenticated: false, usingAuthTokenFromEnv: false };
-  }
-
-  console.log(
-    `[Auth] Using direct auth token${usingAuthTokenFromEnv ? " (from CURSOR_AUTH_TOKEN env)" : ""}...`
-  );
-
-  // Set the token directly (bypasses login flow)
-  await credentialManager.setAuthentication(authToken, authToken);
-
-  return { isAuthenticated: true, usingAuthTokenFromEnv };
-}
-
-// --- Interceptor Logic (from restored/src/client.ts) ---
+// --- Interceptor Logic ---
 
 type Request = { headers: Map<string, string>; url: string };
 type NextFn = (req: Request) => Promise<unknown>;
@@ -359,7 +561,7 @@ function createAuthInterceptor(
     req.headers.set("x-cursor-client-type", "cli");
 
     if (!req.headers.get("x-request-id")) {
-      req.headers.set("x-request-id", crypto.randomUUID());
+      req.headers.set("x-request-id", randomUUID());
     }
 
     return next(req);
@@ -368,12 +570,14 @@ function createAuthInterceptor(
 
 // --- Demo Commands ---
 
-async function showStatus(credentialManager: CredentialManager) {
+async function showStatus(credentialManager: FileCredentialManager) {
   console.log("\n=== Authentication Status ===\n");
+
+  console.log(`Storage: ${credentialManager.getStoragePath()}`);
 
   const creds = await credentialManager.getAllCredentials();
 
-  console.log("Stored Credentials:");
+  console.log("\nStored Credentials:");
   console.log(`  Access Token:  ${maskToken(creds.accessToken)}`);
   console.log(`  Refresh Token: ${maskToken(creds.refreshToken)}`);
   console.log(`  API Key:       ${maskToken(creds.apiKey)}`);
@@ -435,12 +639,50 @@ async function checkToken(credentialManager: CredentialManager) {
   const timeLeft = exp - now;
 
   if (timeLeft < 0) {
-    console.log(`Token Status: EXPIRED (${formatDuration(Math.abs(timeLeft))} ago)`);
+    console.log(
+      `Token Status: EXPIRED (${formatDuration(Math.abs(timeLeft))} ago)`
+    );
   } else if (isExpiring) {
-    console.log(`Token Status: EXPIRING SOON (${formatDuration(timeLeft)} remaining)`);
+    console.log(
+      `Token Status: EXPIRING SOON (${formatDuration(timeLeft)} remaining)`
+    );
     console.log("  -> Token refresh would be triggered on next request");
   } else {
     console.log(`Token Status: VALID (${formatDuration(timeLeft)} remaining)`);
+  }
+}
+
+async function performLogin(credentialManager: CredentialManager) {
+  console.log("\n=== OAuth Login ===\n");
+
+  const loginManager = new LoginManager();
+  const { metadata, loginUrl } = loginManager.startLogin();
+
+  console.log("Opening browser for authentication...");
+  console.log(`\nIf your browser doesn't open, visit this URL:\n${loginUrl}\n`);
+
+  try {
+    await openBrowser(loginUrl);
+  } catch {
+    console.log("(Could not open browser automatically)");
+  }
+
+  console.log("Waiting for authentication");
+  const authResult = await loginManager.waitForResult(metadata);
+
+  if (authResult) {
+    await credentialManager.setAuthentication(
+      authResult.accessToken,
+      authResult.refreshToken
+    );
+
+    const payload = decodeJwtPayload(authResult.accessToken);
+    console.log("Login successful!");
+    console.log(`  Auth ID: ${payload?.sub || "(unknown)"}`);
+    console.log(`  Token stored securely.`);
+  } else {
+    console.log("Login failed or was cancelled.");
+    process.exit(1);
   }
 }
 
@@ -491,7 +733,9 @@ async function runDemo(credentialManager: CredentialManager) {
     console.log("   [Network] Headers:");
     req.headers.forEach((value, key) => {
       if (key === "authorization") {
-        console.log(`     ${key}: Bearer ${maskToken(value.replace("Bearer ", ""))}`);
+        console.log(
+          `     ${key}: Bearer ${maskToken(value.replace("Bearer ", ""))}`
+        );
       } else {
         console.log(`     ${key}: ${value}`);
       }
@@ -520,11 +764,96 @@ async function clearCredentials(credentialManager: CredentialManager) {
   console.log("All stored credentials have been cleared.");
 }
 
+async function authenticateWithApiKey(
+  credentialManager: CredentialManager,
+  apiKey?: string
+) {
+  console.log("\n=== API Key Authentication ===\n");
+
+  const key = apiKey ?? process.env.CURSOR_API_KEY;
+  const fromEnv = !apiKey && !!process.env.CURSOR_API_KEY;
+
+  if (!key) {
+    console.log("No API key provided.");
+    console.log("Set CURSOR_API_KEY environment variable or pass as argument:");
+    console.log("  bun scripts/auth-demo.ts auth-key <your-api-key>");
+    return;
+  }
+
+  console.log(
+    `Using API key${fromEnv ? " (from CURSOR_API_KEY env)" : ""}...`
+  );
+
+  const loginManager = new LoginManager();
+  const result = await loginManager.loginWithApiKey(key);
+
+  if (result) {
+    await credentialManager.setAuthentication(
+      result.accessToken,
+      result.refreshToken,
+      key
+    );
+
+    const payload = decodeJwtPayload(result.accessToken);
+    console.log("\nAuthentication successful!");
+    console.log(`  Auth ID: ${payload?.sub || "(unknown)"}`);
+  } else {
+    console.log("\nAuthentication failed. Check your API key.");
+    process.exit(1);
+  }
+}
+
+async function authenticateWithToken(
+  credentialManager: CredentialManager,
+  authToken?: string
+) {
+  console.log("\n=== Direct Token Authentication ===\n");
+
+  const token = authToken ?? process.env.CURSOR_AUTH_TOKEN;
+  const fromEnv = !authToken && !!process.env.CURSOR_AUTH_TOKEN;
+
+  if (!token) {
+    console.log("No auth token provided.");
+    console.log(
+      "Set CURSOR_AUTH_TOKEN environment variable or pass as argument:"
+    );
+    console.log("  bun scripts/auth-demo.ts auth-token <your-token>");
+    return;
+  }
+
+  console.log(
+    `Using direct token${fromEnv ? " (from CURSOR_AUTH_TOKEN env)" : ""}...`
+  );
+
+  // Validate token format
+  const payload = decodeJwtPayload(token);
+  if (!payload) {
+    console.log("\nWarning: Token does not appear to be a valid JWT.");
+  }
+
+  // Set the token directly (bypasses login flow)
+  await credentialManager.setAuthentication(token, token);
+
+  console.log("\nToken stored successfully!");
+  if (payload) {
+    console.log(`  Auth ID: ${payload.sub || "(unknown)"}`);
+    if (typeof payload.exp === "number") {
+      const now = Math.floor(Date.now() / 1000);
+      const timeLeft = payload.exp - now;
+      console.log(`  Expires in: ${formatDuration(timeLeft)}`);
+    }
+  }
+}
+
 // --- Main Entry Point ---
 
 async function main() {
-  const command = process.argv[2] || "status";
-  const domain = "cursor-demo"; // Use demo domain to avoid affecting real credentials
+  const command = process.argv[2] || "help";
+  const arg = process.argv[3];
+
+  // Use "cursor" domain to use the same credentials as real Cursor CLI
+  // Use "cursor-demo" for isolated testing
+  const domain = process.env.CURSOR_AUTH_DOMAIN || "cursor";
 
   console.log("Cursor CLI Authentication Demo");
   console.log("==============================");
@@ -540,11 +869,20 @@ async function main() {
       await checkToken(credentialManager);
       break;
 
-    case "refresh":
+    case "login":
+      await performLogin(credentialManager);
+      break;
+
+    case "logout":
+    case "clear":
+      await clearCredentials(credentialManager);
+      break;
+
+    case "refresh": {
       console.log("\n=== Token Refresh ===\n");
       const token = await getValidAccessToken(
         credentialManager,
-        "https://api2.cursor.sh"
+        CURSOR_API_BASE_URL
       );
       if (token) {
         console.log("Token retrieved (refresh attempted if needed).");
@@ -552,57 +890,44 @@ async function main() {
         console.log("No token available.");
       }
       break;
-
-    case "clear":
-      await clearCredentials(credentialManager);
-      break;
+    }
 
     case "demo":
       await runDemo(credentialManager);
       break;
 
-    case "auth-key": {
-      const apiKey = process.argv[3];
-      const result = await tryApiKeyAuth(credentialManager, {
-        apiKey,
-        endpoint: "https://api2.cursor.sh",
-      });
-      if (result.isAuthenticated) {
-        console.log("\nAPI key authentication simulated successfully.");
-        if (result.usingApiKeyFromEnv) {
-          console.log("(API key was read from CURSOR_API_KEY environment variable)");
-        }
-      } else {
-        console.log("\nNo API key provided. Set CURSOR_API_KEY or pass as argument.");
-      }
+    case "auth-key":
+      await authenticateWithApiKey(credentialManager, arg);
       break;
-    }
 
-    case "auth-token": {
-      const authToken = process.argv[3];
-      const result = await tryAuthTokenAuth(credentialManager, { authToken });
-      if (result.isAuthenticated) {
-        console.log("\nDirect token authentication successful.");
-        if (result.usingAuthTokenFromEnv) {
-          console.log("(Token was read from CURSOR_AUTH_TOKEN environment variable)");
-        }
-      } else {
-        console.log("\nNo auth token provided. Set CURSOR_AUTH_TOKEN or pass as argument.");
-      }
+    case "auth-token":
+      await authenticateWithToken(credentialManager, arg);
       break;
-    }
 
+    case "help":
     default:
-      console.log(`\nUnknown command: ${command}`);
+      if (command !== "help") {
+        console.log(`\nUnknown command: ${command}`);
+      }
       console.log("\nAvailable commands:");
       console.log("  status     - Show current authentication status");
       console.log("  check      - Check if token is valid/expiring");
+      console.log("  login      - Perform real OAuth login via browser");
+      console.log("  logout     - Clear stored credentials");
       console.log("  refresh    - Force token refresh (requires API key)");
-      console.log("  clear      - Clear stored credentials");
-      console.log("  demo       - Run full demo with mock interceptor");
-      console.log("  auth-key   - Authenticate using API key (from env or arg)");
-      console.log("  auth-token - Authenticate using direct token (from env or arg)");
-      process.exit(1);
+      console.log("  demo       - Run demo with mock interceptor");
+      console.log("  auth-key   - Authenticate using API key");
+      console.log("  auth-token - Authenticate using direct token");
+      console.log("\nEnvironment variables:");
+      console.log("  CURSOR_API_KEY      - API key for authentication");
+      console.log("  CURSOR_AUTH_TOKEN   - Direct JWT token");
+      console.log(
+        "  CURSOR_AUTH_DOMAIN  - Storage domain (default: cursor)"
+      );
+      if (command !== "help") {
+        process.exit(1);
+      }
+      break;
   }
 }
 
