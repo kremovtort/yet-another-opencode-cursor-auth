@@ -423,7 +423,7 @@ export class CursorClient {
       "connect-protocol-version": "1",
       "user-agent": "connect-es/1.4.0",
       "x-cursor-checksum": checksum,
-      "x-cursor-client-version": "0.42.3",
+      "x-cursor-client-version": "cli-2025.11.25-d5b3271",
       "x-cursor-client-type": "cli",
       "x-cursor-timezone": Intl.DateTimeFormat().resolvedOptions().timeZone,
       "x-ghost-mode": "true",

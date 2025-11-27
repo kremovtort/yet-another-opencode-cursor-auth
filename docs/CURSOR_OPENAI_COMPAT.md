@@ -47,3 +47,9 @@ Summary of how to call the Cursor API and present it as an OpenAI‐style `/v1/c
 4) Wire the loader’s `fetch` override to use the shim when the target URL is OpenAI‑style; otherwise fall back to the original fetch (done in `src/plugin/plugin.ts`).
 5) Keep auth refresh logic intact so tokens remain valid mid‑stream; surface errors in OpenAI error format (done via existing refresh path).
 6) Next work items: consider tool/function-call translation if needed, and propagate any usage tokens if Cursor starts returning them. Model aliasing is currently static; the Cursor CLI can also fetch model lists via `AiService.GetUsableModels`—we can mirror that later for dynamic population.
+
+## Current status and gaps
+- **Models:** We now call `AiService.GetUsableModels` over Connect+JSON to populate `provider.models` with modelId/displayModelId/aliases. Verified live; 17 models returned (composer, auto, sonnet/opus 4.5, gpt-5 variants, etc.).
+- **Chat:** All known chat RPCs tested (`StreamChat`, `StreamChatWeb`, `StreamChatContext`, `StreamChatDeepContext`, `TaskStreamChatContext`) return `ERROR_DEPRECATED` (“Request type deprecated. Please upgrade to the latest version of Cursor.”) or similar when called with our hand-rolled payload. Adjusting headers/client-version did not fix this. The backend contract has changed.
+- **Protos:** The bundles in `cursor-agent-source`/`cursor-agent-restored-source-code` only include bundled JS fragments; there are no raw `.proto` files or clean generated exports. Without the current proto definitions, we can’t construct the new chat request shape that the backend expects.
+- **OpenAI shim impact:** The OpenAI-compatible fetch path is implemented, but until we have the correct chat RPC/message shape, chat requests will fail against the live Cursor backend. Model listing and auth refresh do work.
