@@ -16,12 +16,12 @@ export const CURSOR_UNIFIED_CHAT_ENDPOINT =
   "/aiserver.v1.AiService/StreamUnifiedChatWithTools";
 
 type UnifiedDeps = {
-  ConversationMessage: any;
-  ConversationMessage_MessageType: any;
-  StreamUnifiedChatRequest: any;
-  StreamUnifiedChatRequestWithTools: any;
-  StreamUnifiedChatRequest_UnifiedMode: any;
-  StreamUnifiedChatResponse: any;
+  ConversationMessage?: any;
+  ConversationMessage_MessageType?: any;
+  StreamUnifiedChatRequest?: any;
+  StreamUnifiedChatRequestWithTools?: any;
+  StreamUnifiedChatRequest_UnifiedMode?: any;
+  StreamUnifiedChatResponse?: any;
   ModelDetails?: any;
 };
 
@@ -36,7 +36,7 @@ async function loadUnifiedDeps(): Promise<UnifiedDeps | null> {
     try {
       const exports = await loadUnifiedExports();
       if (!exports) return null;
-      return exports;
+      return exports as UnifiedDeps;
     } catch (error) {
       console.warn("Failed to load unified proto bundle:", error);
       return null;
@@ -326,7 +326,7 @@ function decodeVarint(data: Uint8Array, offset: number): { value: number; bytesR
   let bytesRead = 0;
   
   while (offset + bytesRead < data.length) {
-    const byte = data[offset + bytesRead];
+    const byte = data[offset + bytesRead]!;
     value |= (byte & 0x7f) << shift;
     bytesRead++;
     
@@ -390,10 +390,10 @@ export function parseStreamChunks(buffer: Uint8Array): StreamChunk[] {
   
   while (offset + 5 <= buffer.length) {
     const flags = buffer[offset];
-    const length = (buffer[offset + 1] << 24) |
-                   (buffer[offset + 2] << 16) |
-                   (buffer[offset + 3] << 8) |
-                   buffer[offset + 4];
+    const length = (buffer[offset + 1]! << 24) |
+                   (buffer[offset + 2]! << 16) |
+                   (buffer[offset + 3]! << 8) |
+                   buffer[offset + 4]!;
     
     offset += 5;
     
@@ -442,10 +442,10 @@ export function parseUnifiedStreamChunks(
   while (offset + 5 <= buffer.length) {
     const flags = buffer[offset];
     const length =
-      (buffer[offset + 1] << 24) |
-      (buffer[offset + 2] << 16) |
-      (buffer[offset + 3] << 8) |
-      buffer[offset + 4];
+      (buffer[offset + 1]! << 24) |
+      (buffer[offset + 2]! << 16) |
+      (buffer[offset + 3]! << 8) |
+      buffer[offset + 4]!;
 
     offset += 5;
 
@@ -497,8 +497,8 @@ export function generateChecksum(token: string): string {
   const calc = (data: Buffer): void => {
     let t = 165;
     for (let i = 0; i < data.length; i++) {
-      data[i] = (data[i] ^ t) + i;
-      t = data[i];
+      data[i] = ((data[i]! ^ t) + i) & 0xff;
+      t = data[i]!;
     }
   };
   
@@ -554,15 +554,16 @@ export class CursorClient {
   
   /**
    * Get request headers for Cursor API
+   * 
+   * IMPORTANT: Cursor's API requires `application/grpc-web+proto` content-type.
+   * Using `application/connect+proto` returns 415 Unsupported Media Type.
    */
   private getHeaders(): Record<string, string> {
     const checksum = generateChecksum(this.accessToken);
     
     return {
       "authorization": `Bearer ${this.accessToken}`,
-      "content-type": "application/connect+proto",
-      "connect-accept-encoding": "gzip,br",
-      "connect-protocol-version": "1",
+      "content-type": "application/grpc-web+proto",
       "user-agent": "connect-es/1.4.0",
       "x-cursor-checksum": checksum,
       "x-cursor-client-version": "cli-2025.11.25-d5b3271",
@@ -780,10 +781,115 @@ export class CursorClient {
       reader.releaseLock();
     }
   }
+
+  /**
+   * Fetch available models from the Cursor API.
+   * This is a working endpoint that returns the list of models available to the user.
+   */
+  async getModels(): Promise<{ models: any[] }> {
+    const emptyPayload = addConnectEnvelope(new Uint8Array(0), 0);
+    
+    const response = await fetch(`${this.baseUrl}/aiserver.v1.AiService/GetUsableModels`, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: Buffer.from(emptyPayload),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Cursor API error: ${response.status} - ${errorText}`);
+    }
+
+    const buffer = new Uint8Array(await response.arrayBuffer());
+    // Parse gRPC-web frame
+    if (buffer.length < 5) {
+      return { models: [] };
+    }
+    
+    const flags = buffer[0];
+    const length = (buffer[1]! << 24) | (buffer[2]! << 16) | (buffer[3]! << 8) | buffer[4]!;
+    
+    // Check for trailer frame (flags=128)
+    if (flags === 128) {
+      // Trailer frame - parse error if present
+      const trailerData = buffer.slice(5, 5 + length);
+      const trailerText = new TextDecoder().decode(trailerData);
+      if (trailerText.includes('grpc-status:') && !trailerText.includes('grpc-status: 0')) {
+        throw new Error(`gRPC error: ${trailerText}`);
+      }
+      return { models: [] };
+    }
+    
+    // For now, return raw proto data indicator - proper parsing requires proto definitions
+    // The response is a GetUsableModelsResponse protobuf message
+    return { 
+      models: [{ raw: true, size: length }]
+    };
+  }
+
+  /**
+   * Fetch the default model for CLI usage.
+   */
+  async getDefaultModel(): Promise<{ model: any | null }> {
+    const emptyPayload = addConnectEnvelope(new Uint8Array(0), 0);
+    
+    const response = await fetch(`${this.baseUrl}/aiserver.v1.AiService/GetDefaultModelForCli`, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: Buffer.from(emptyPayload),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Cursor API error: ${response.status} - ${errorText}`);
+    }
+
+    const buffer = new Uint8Array(await response.arrayBuffer());
+    if (buffer.length < 5) {
+      return { model: null };
+    }
+    
+    const flags = buffer[0];
+    const length = (buffer[1]! << 24) | (buffer[2]! << 16) | (buffer[3]! << 8) | buffer[4]!;
+    
+    if (flags === 128 || length === 0) {
+      return { model: null };
+    }
+    
+    // Return raw proto data indicator
+    return { 
+      model: { raw: true, size: length }
+    };
+  }
+
+  /**
+   * Health check endpoint.
+   */
+  async healthCheck(): Promise<boolean> {
+    const emptyPayload = addConnectEnvelope(new Uint8Array(0), 0);
+    
+    const response = await fetch(`${this.baseUrl}/aiserver.v1.AiService/HealthCheck`, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: Buffer.from(emptyPayload),
+    });
+
+    return response.ok;
+  }
 }
 
 /**
  * Create a Cursor API client
+ * 
+ * NOTE: As of late 2024, Cursor has deprecated the legacy StreamChat endpoint.
+ * Chat functionality now requires the AgentService with bidirectional streaming.
+ * The client currently supports:
+ * - getModels() - Fetch available models
+ * - getDefaultModel() - Get default model for CLI
+ * - healthCheck() - Check API health
+ * 
+ * For chat completions, you need to use the AgentService endpoints which require
+ * proper proto message construction and bidirectional streaming support.
  */
 export function createCursorClient(
   accessToken: string,
