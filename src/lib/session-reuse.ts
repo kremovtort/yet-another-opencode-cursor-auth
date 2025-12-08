@@ -1,0 +1,252 @@
+import crypto from "node:crypto";
+import type { ExecRequest, McpExecRequest } from "./api/agent-service";
+
+export interface OpenAIToolCallLite {
+  id?: string;
+  function?: { name?: string; arguments?: string };
+}
+
+export interface OpenAIMessageLite {
+  role: "system" | "user" | "assistant" | "tool";
+  content: any;
+  tool_calls?: OpenAIToolCallLite[];
+  tool_call_id?: string;
+}
+
+export interface SessionLike {
+  id: string;
+  iterator: AsyncIterator<any>;
+  pendingExecs: Map<string, ExecRequest>;
+  createdAt: number;
+  lastActivity: number;
+  state: "running" | "waiting_tool";
+  client: {
+    sendToolResult: SessionClient["sendToolResult"];
+    sendShellResult: SessionClient["sendShellResult"];
+    sendReadResult: SessionClient["sendReadResult"];
+    sendLsResult: SessionClient["sendLsResult"];
+    sendGrepResult: SessionClient["sendGrepResult"];
+  };
+}
+
+export interface SessionClient {
+  sendToolResult: (
+    execRequest: McpExecRequest & { type: "mcp" },
+    result: { success?: { content: string; isError?: boolean }; error?: string }
+  ) => Promise<void>;
+  sendShellResult: (
+    id: number,
+    execId: string | undefined,
+    command: string,
+    cwd: string,
+    stdout: string,
+    stderr: string,
+    exitCode: number,
+    executionTimeMs?: number
+  ) => Promise<void>;
+  sendReadResult: (
+    id: number,
+    execId: string | undefined,
+    content: string,
+    path: string,
+    totalLines?: number,
+    fileSize?: bigint,
+    truncated?: boolean
+  ) => Promise<void>;
+  sendLsResult: (id: number, execId: string | undefined, filesString: string) => Promise<void>;
+  sendGrepResult: (
+    id: number,
+    execId: string | undefined,
+    pattern: string,
+    path: string,
+    files: string[]
+  ) => Promise<void>;
+}
+
+export function createSessionId(): string {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+}
+
+export function makeToolCallId(sessionId: string, callBase: string): string {
+  return `sess_${sessionId}__call_${callBase}`;
+}
+
+export function parseSessionIdFromToolCallId(toolCallId: string | null | undefined): string | null {
+  if (!toolCallId) return null;
+  const match = toolCallId.match(/^sess_([a-zA-Z0-9]+)__call_/);
+  if (!match) return null;
+  return match[1] ?? null;
+}
+
+export function findSessionIdInMessages(messages: OpenAIMessageLite[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg) continue;
+    if (msg.role === "tool" && msg.tool_call_id) {
+      const sessionId = parseSessionIdFromToolCallId(msg.tool_call_id);
+      if (sessionId) return sessionId;
+    }
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        const sessionId = parseSessionIdFromToolCallId(tc?.id);
+        if (sessionId) return sessionId;
+      }
+    }
+  }
+  return null;
+}
+
+export function collectToolMessages(messages: OpenAIMessageLite[]): OpenAIMessageLite[] {
+  return messages.filter((m) => m?.role === "tool" && !!m.tool_call_id);
+}
+
+export function extractMessageContent(message: OpenAIMessageLite): string {
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) {
+    return (message.content as unknown[])
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && "text" in (part as Record<string, unknown>)) {
+          const text = (part as Record<string, unknown>).text;
+          return typeof text === "string" ? text : "";
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("");
+  }
+  return "";
+}
+
+export function selectCallBase(execReq: ExecRequest): string {
+  const raw =
+    execReq.type === "mcp"
+      ? execReq.toolCallId
+      : (execReq as { execId?: string }).execId ?? String((execReq as { id?: number }).id ?? crypto.randomUUID());
+  const cleaned = raw.replace(/[^a-zA-Z0-9]/g, "");
+  return cleaned.slice(0, 32) || crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+}
+
+export function mapExecRequestToTool(execReq: ExecRequest): {
+  toolName: string | null;
+  toolArgs: Record<string, any> | null;
+} {
+  if (execReq.type === "shell") {
+    const toolArgs: Record<string, any> = { command: execReq.command };
+    if (execReq.cwd) toolArgs.cwd = execReq.cwd;
+    return { toolName: "bash", toolArgs };
+  }
+  if (execReq.type === "read") {
+    return { toolName: "read", toolArgs: { filePath: execReq.path } };
+  }
+  if (execReq.type === "ls") {
+    return { toolName: "list", toolArgs: { path: execReq.path } };
+  }
+  if (execReq.type === "grep") {
+    const toolName = execReq.glob ? "glob" : "grep";
+    const toolArgs = execReq.glob
+      ? { pattern: execReq.glob, path: execReq.path }
+      : { pattern: execReq.pattern, path: execReq.path };
+    return { toolName, toolArgs };
+  }
+  if (execReq.type === "mcp") {
+    return { toolName: execReq.toolName, toolArgs: execReq.args };
+  }
+  return { toolName: null, toolArgs: null };
+}
+
+export function safeParseJson(input: string): Record<string, any> | null {
+  try {
+    return JSON.parse(input);
+  } catch {
+    return null;
+  }
+}
+
+export async function sendToolResultsToCursor(
+  session: SessionLike,
+  toolMessages: OpenAIMessageLite[]
+): Promise<boolean> {
+  for (const message of toolMessages) {
+    if (!message.tool_call_id) continue;
+    const execReq = session.pendingExecs.get(message.tool_call_id);
+    if (!execReq) {
+      console.warn(`[Session ${session.id}] Missing exec request for tool_call_id ${message.tool_call_id}`);
+      return false;
+    }
+
+    const content = extractMessageContent(message);
+
+    try {
+      if (execReq.type === "mcp") {
+        await session.client.sendToolResult(execReq as McpExecRequest & { type: "mcp" }, {
+          success: { content, isError: false },
+        });
+      } else if (execReq.type === "shell") {
+        const parsed = safeParseJson(content);
+        const stdout = parsed && typeof parsed.stdout === "string" ? parsed.stdout : content;
+        const stderr = parsed && typeof parsed.stderr === "string" ? parsed.stderr : "";
+        const exitCode = parsed && typeof parsed.exitCode === "number" ? parsed.exitCode : 0;
+        const executionTimeMs = parsed && typeof parsed.executionTimeMs === "number" ? parsed.executionTimeMs : undefined;
+        await session.client.sendShellResult(
+          execReq.id,
+          execReq.execId,
+          execReq.command,
+          execReq.cwd || process.cwd(),
+          stdout,
+          stderr,
+          exitCode,
+          executionTimeMs
+        );
+      } else if (execReq.type === "read") {
+        await session.client.sendReadResult(
+          execReq.id,
+          execReq.execId,
+          content,
+          execReq.path,
+          content.split("\n").length,
+          BigInt(content.length),
+          false
+        );
+      } else if (execReq.type === "ls") {
+        await session.client.sendLsResult(execReq.id, execReq.execId, content);
+      } else if (execReq.type === "grep") {
+        const files = content.trim().split("\n").filter(Boolean);
+        const pattern = execReq.glob ?? execReq.pattern ?? "";
+        const path = execReq.path ?? process.cwd();
+        await session.client.sendGrepResult(execReq.id, execReq.execId, pattern, path, files);
+      } else {
+        return false;
+      }
+    } catch (err) {
+      console.error(`[Session ${session.id}] Failed to send tool result for ${message.tool_call_id}:`, err);
+      return false;
+    }
+
+    session.pendingExecs.delete(message.tool_call_id);
+  }
+
+  session.state = "running";
+  session.lastActivity = Date.now();
+  return true;
+}
+
+export async function cleanupExpiredSessions(
+  sessionMap: Map<string, { iterator?: AsyncIterator<any>; lastActivity: number }>,
+  timeoutMs: number,
+  now: number = Date.now()
+): Promise<void> {
+  for (const [sessionId, session] of sessionMap) {
+    if (now - session.lastActivity > timeoutMs) {
+      try {
+        if (session.iterator && typeof session.iterator.return === "function") {
+          await session.iterator.return(undefined as any);
+        }
+      } catch (err) {
+        console.warn(`[Session ${sessionId}] Failed to close expired iterator:`, err);
+      } finally {
+        sessionMap.delete(sessionId);
+      }
+    }
+  }
+}

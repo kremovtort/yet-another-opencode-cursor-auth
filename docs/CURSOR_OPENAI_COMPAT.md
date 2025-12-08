@@ -159,3 +159,25 @@ Assistant: <continuation after tool>
 - Simulate multi-turn with a fake client: first request emits tool_call, second sends tool result, ensure the same session is used (no new bootstrap) and continuation arrives.
 - Parallel sessions: two distinct `sessionId`s, interleave tool results, ensure no cross-talk.
 - Expired session fallback: delete session mid-test, verify fresh session is created and request still succeeds (with an extra bootstrap).
+
+### Implementation checklist (first pass)
+- Add a session store (module-level Map) keyed by `sessionId`; entries keep `client`, `iterator`, `appendSeqno`, `model`, `createdAt`, `lastActivity`, `pendingExecs` (per-call metadata for tool_call_id synthesis).
+- First request path: generate `sessionId`, start `chatStream`, stream chunks until an `exec_request` arrives, then emit OpenAI `tool_calls` + `finish_reason: "tool_calls"`, park the iterator (store async iterator + client + append seqno), and return.
+- Follow-up path: parse `tool_call_id` to recover `sessionId`; look up session entry; if found, send `bidiAppend` with tool result, resume the parked iterator, and stream until next exec_request or natural finish. If not found, start a fresh session as fallback.
+- Idle/expiration: sweep the session map periodically (or check per request) and close streams older than timeout; ensure append attempts on expired sessions return a clear error to the OpenAI client.
+- Logging/metrics: record session create/close, resume count, append failures, and fallback occurrences to confirm reuse savings.
+
+### Minimal state machine (server-side)
+- `running`: actively streaming assistant tokens; may transition to `waiting_tool` on `exec_request`.
+- `waiting_tool`: OpenAI SSE closed with `finish_reason: "tool_calls"`; Cursor stream parked. Transitions to `running` when tool result arrives via `bidiAppend`.
+- `closed`: terminal state when Cursor finishes, errors, or idle timeout hits. Unknown/expired `sessionId` should start a new `running` session instead of reviving `closed`.
+
+### Request handling details
+- **OpenAI chunking:** While running, wrap Cursor `delta` as normal OpenAI chunks. On `exec_request`, flush any buffered partials, emit `tool_calls`, then send the `[DONE]` SSE and close the HTTP response while keeping the Cursor stream alive.
+- **Tool result ingestion:** Accept `role:"tool"` messages with `tool_call_id`, map back to Cursor call id, serialize as `bidiAppend`, and resume iteration. Preserve Cursor’s `appendSeqno` ordering.
+- **Graceful fallbacks:** If `tool_call_id` is malformed or session missing, start a new Cursor stream (pay bootstrap) and continue so clients never stall.
+
+### Cleanup and timeouts
+- Default idle timeout: 15m since last activity; configurable via env/flag. On timeout, close Cursor client/iterator and delete session entry.
+- Force-close on repeated append failures or Cursor error frames; surface error to OpenAI client with an OpenAI-shaped error body.
+- Keep session map bounded (LRU or max count) to avoid leaking streams when many windows churn.
