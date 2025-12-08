@@ -1,6 +1,6 @@
 # Tool Calling Investigation Summary
 
-**Date**: December 8, 2025  
+**Date**: December 8, 2025
 **Status**: ✅ Tool execution working (shell, ls, read, grep/glob) - Model continuation issue pending
 
 ## Latest Status (Session 6)
@@ -231,7 +231,7 @@ When tools are provided AND the user asks for tool execution:
 ### 1. Exec Server Capability Required
 The Cursor backend may expect an exec server to be established before processing tool calls. The native client uses `ClientExecController` to handle `ExecServerMessage` from the server.
 
-**Evidence**: 
+**Evidence**:
 - Native code has `execHandler = new ClientExecController(execStream, execOutputStream, controlledExecManager)`
 - We never receive `field2` (exec_server_message), suggesting server may not send tool calls without exec capability
 
@@ -293,8 +293,8 @@ const promise = monitoredRequestStream.write(new agent_service_pb.AgentClientMes
 
 // Exec handler processes tool execution
 const execHandler = new ClientExecController(
-  execStream, 
-  execOutputStream, 
+  execStream,
+  execOutputStream,
   controlledExecManager
 );
 ```
@@ -359,7 +359,7 @@ After analyzing `connect.js`, `exec-controller.js`, `controlled.js`, and `mcp.js
 message ExecServerMessage {
   uint32 id = 1;          // Correlation ID
   string exec_id = 15;    // Unique execution ID
-  
+
   oneof message {
     ShellArgs shell_args = 2;
     WriteArgs write_args = 3;
@@ -378,7 +378,7 @@ message ExecServerMessage {
     RecordScreenArgs record_screen_args = 21;
     ComputerUseArgs computer_use_args = 22;
   }
-  
+
   SpanContext span_context = 19;
 }
 ```
@@ -399,7 +399,7 @@ message McpArgs {
 message ExecClientMessage {
   uint32 id = 1;          // Must match ExecServerMessage.id
   string exec_id = 15;    // Must match ExecServerMessage.exec_id
-  
+
   oneof message {
     ShellResult shell_result = 2;
     WriteResult write_result = 3;
@@ -508,7 +508,7 @@ Use Cursor in "ask" mode without tools, then handle tools entirely on our side.
 // In chatStream(), when we receive ExecServerMessage:
 if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
   const execMsg = parseExecServerMessage(field.value);
-  
+
   if (execMsg.messageType === 'mcp_args') {
     // Convert to OpenAI tool call
     const toolCallChunk = {
@@ -520,14 +520,14 @@ if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Ui
       },
     };
     yield toolCallChunk;
-    
+
     // Wait for tool result from caller (need new protocol)
     const result = await waitForToolResult(execMsg.toolCallId);
-    
+
     // Send result back to Cursor
     const execClientMsg = buildExecClientMessage(execMsg.id, result);
     await this.bidiAppend(requestId, appendSeqno++, execClientMsg);
-    
+
     // Send control message
     const controlMsg = buildExecClientControlMessage(execMsg.id);
     await this.bidiAppend(requestId, appendSeqno++, controlMsg);
