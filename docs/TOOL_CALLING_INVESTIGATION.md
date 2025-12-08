@@ -780,6 +780,180 @@ Client                                     Server
 9. ⬜ Implement proper LsDirectoryTreeNode format
 10. ⬜ Test MCP tool round-trip (mcp_args → client → mcp_result)
 
+## Session 9: Tool Result Flow Investigation (Dec 9, 2025)
+
+### Problem Statement
+
+After sending tool results back to Cursor via `BidiAppend`, the model stops streaming text responses. Only heartbeats are received, and the turn never completes.
+
+### Key Discovery: Two Different Flows
+
+Testing revealed **two fundamentally different behaviors** depending on how tool results are sent:
+
+#### Flow A: Fresh Request with History (WORKING ✅)
+
+When tool results are sent as part of a **new HTTP request** with full conversation history:
+
+```
+Client                                     Server
+  |                                          |
+  |--- NEW Request with history ------------>|
+  |    [user, assistant+tool_call, tool]     |
+  |                                          |
+  |<--- interaction_update (text_delta) -----|  ✅ AI responds with text
+  |<--- interaction_update (text_delta) -----|
+  |<--- turn_ended (field 14) ---------------|  ✅ Turn completes
+```
+
+**Test:**
+```bash
+curl -X POST http://localhost:18741/v1/chat/completions \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "What is the weather in Paris?"},
+      {"role": "assistant", "content": "Getting weather...", 
+       "tool_calls": [{"id": "call_abc", "function": {"name": "get_weather", "arguments": "{}"}}]},
+      {"role": "tool", "tool_call_id": "call_abc", "content": "59°F, cloudy"}
+    ]
+  }'
+```
+
+**Result:** Model responds with text: "Current weather in Paris: 59°F, light rain, cloudy."
+
+#### Flow B: BidiAppend to Existing Stream (NOT WORKING ❌)
+
+When tool results are sent via **BidiAppend** to continue an existing stream:
+
+```
+Client                                     Server
+  |                                          |
+  |--- Initial Request ---------------------->|
+  |<--- exec_server_message (mcp_args) -------|
+  |--- ExecClientMessage (mcp_result) ------->|  Tool result sent
+  |--- ExecClientControlMessage (close) ----->|  Stream closed
+  |                                          |
+  |<--- tool_call_completed (field 3) --------|  ✅ Acknowledged
+  |<--- kv_server_message (set_blob) ---------|  Response stored in KV!
+  |<--- heartbeat (field 13) -----------------|  ❌ Only heartbeats
+  |<--- heartbeat (field 13) -----------------|
+  |    ... no text, no turn_ended ...        |
+```
+
+**What Happens:**
+1. Tool result is acknowledged (`tool_call_completed`)
+2. Model generates response but stores it in **KV blob** instead of streaming
+3. No `text_delta` (field 1) or `token_delta` (field 8) in InteractionUpdate
+4. No `turn_ended` (field 14) ever received
+5. Stream stuck in heartbeat loop
+
+**KV Blob Contents (from logs):**
+```json
+{"id":"1","role":"assistant","content":[{"type":"text","text":"<think>\nThe user wants to know the weather..."}]}
+```
+
+### Root Cause Analysis
+
+The Cursor server behaves differently for **mid-turn tool results** vs **new conversation turns**:
+
+| Aspect | Fresh Request | BidiAppend |
+|--------|--------------|------------|
+| Text delivery | `InteractionUpdate.text_delta` | KV blob storage |
+| Turn completion | `turn_ended` received | Never received |
+| Response format | Streaming chunks | JSON in blob |
+
+**Hypothesis**: The server is designed for the Cursor IDE which can:
+1. Pull text from KV blobs for checkpoint/resume
+2. Use a different rendering path for mid-turn continuations
+3. Has UI-specific handling for tool result flows
+
+Our OpenAI-compatible proxy doesn't have access to this KV blob rendering logic.
+
+### Potential Solutions
+
+#### Option A: Don't Use Session Reuse for Tools (Simple)
+
+For requests that will involve tool calls, always start fresh sessions. This matches how most OpenAI clients work anyway.
+
+**Pros:** Works immediately, no protocol changes needed
+**Cons:** Loses session continuity benefits, may be slower
+
+#### Option B: Extract Text from KV Blobs (Medium)
+
+Parse the JSON blobs stored in KV and extract the text response.
+
+```typescript
+// In handleKvMessage:
+if (kvMsg.messageType === 'set_blob_args' && kvMsg.blobData) {
+  try {
+    const json = JSON.parse(new TextDecoder().decode(kvMsg.blobData));
+    if (json.role === 'assistant' && json.content) {
+      const text = extractTextFromContent(json.content);
+      if (text) yield { type: "text", content: text };
+    }
+  } catch {}
+}
+```
+
+**Pros:** Keeps session reuse working
+**Cons:** Complex, timing issues (text arrives before turn_ended), may miss content
+
+#### Option C: Find the Continue Signal (Ideal) ⬅️ INVESTIGATING
+
+There may be a message or signal we're not sending that tells the server to continue streaming instead of storing in KV.
+
+**Candidates to investigate:**
+1. `ConversationAction` with a "continue" action after tool result
+2. Additional field in `ExecClientControlMessage` 
+3. Something in the checkpoint structure we need to echo back
+4. A different `RequestContext` field for continuation
+
+### Investigation Notes
+
+**Fields we handle in AgentServerMessage:**
+- Field 1: `interaction_update` - text, tool calls, turn_ended
+- Field 2: `exec_server_message` - tool execution requests
+- Field 3: `conversation_checkpoint_update` - checkpoints
+- Field 4: `kv_server_message` - blob operations
+- Field 5: `exec_server_control_message` - abort signals (added)
+- Field 7: `interaction_query` - user approval requests (added)
+
+**Messages we send after tool result:**
+1. `ExecClientMessage` with `mcp_result`
+2. `ExecClientControlMessage` with `stream_close`
+
+**What native Cursor client might send additionally:**
+- Need to investigate `ConversationAction` structure
+- Check if there's a "continue generation" action type
+- Look at how checkpoints are used in continuation
+
+### Test Commands
+
+**Test Flow A (Fresh - Working):**
+```bash
+curl -s -X POST http://localhost:18741/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "Weather in Paris?"},
+      {"role": "assistant", "content": "Checking...", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}]},
+      {"role": "tool", "tool_call_id": "call_1", "content": "59°F cloudy"}
+    ]
+  }'
+```
+
+**Test Flow B (Session Reuse - Broken):**
+```bash
+# Step 1: Get tool call
+curl ... -d '{"messages": [{"role": "user", "content": "Weather?"}], "tools": [...]}'
+# Returns: tool_call with session ID prefix
+
+# Step 2: Send tool result (triggers BidiAppend path)
+curl ... -d '{"messages": [..., {"role": "tool", "tool_call_id": "sess_xxx__call_yyy", "content": "result"}]}'
+# Returns: empty response (text in KV only)
+```
+
 ## Environment
 
 - **Platform**: macOS (darwin)
