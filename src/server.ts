@@ -358,25 +358,69 @@ function generateId(): string {
   return `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 }
 
+/**
+ * Convert OpenAI messages array to a prompt string for Cursor.
+ * Handles the full message history including:
+ * - system messages (prepended)
+ * - user messages
+ * - assistant messages (including those with tool_calls)
+ * - tool result messages (role: "tool")
+ * 
+ * For multi-turn conversations with tool calls, this formats the conversation
+ * so the model can see what tools were called and their results.
+ */
 function messagesToPrompt(messages: OpenAIMessage[]): string {
-  // For simple cases, just use the last user message
-  // For more complex cases, we could format the conversation
-  const userMessages = messages.filter(m => m.role === "user");
+  const parts: string[] = [];
+  
+  // Extract system messages to prepend
   const systemMessages = messages.filter(m => m.role === "system");
-  
-  let prompt = "";
-  
-  // Prepend system message if present
   if (systemMessages.length > 0) {
-    prompt += systemMessages.map(m => m.content).join("\n") + "\n\n";
+    parts.push(systemMessages.map(m => m.content ?? "").join("\n"));
   }
   
-  // Add the user message(s)
-  if (userMessages.length > 0) {
-    prompt += userMessages[userMessages.length - 1]?.content ?? "";
+  // Process non-system messages in order
+  const conversationMessages = messages.filter(m => m.role !== "system");
+  
+  // Check if this is a continuation with tool results
+  const hasToolResults = conversationMessages.some(m => m.role === "tool");
+  
+  if (hasToolResults) {
+    // Multi-turn with tool results - format the full conversation
+    for (const msg of conversationMessages) {
+      if (msg.role === "user") {
+        parts.push(`User: ${msg.content ?? ""}`);
+      } else if (msg.role === "assistant") {
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          // Assistant made tool calls - show what was called
+          const toolCallsDesc = msg.tool_calls.map(tc => 
+            `[Called tool: ${tc.function.name}(${tc.function.arguments})]`
+          ).join("\n");
+          if (msg.content) {
+            parts.push(`Assistant: ${msg.content}\n${toolCallsDesc}`);
+          } else {
+            parts.push(`Assistant: ${toolCallsDesc}`);
+          }
+        } else if (msg.content) {
+          parts.push(`Assistant: ${msg.content}`);
+        }
+      } else if (msg.role === "tool") {
+        // Tool result - show the result with the tool call ID for context
+        parts.push(`[Tool result for ${msg.tool_call_id}]: ${msg.content ?? ""}`);
+      }
+    }
+    
+    // Add instruction for the model to continue
+    parts.push("\nBased on the tool results above, please continue your response:");
+  } else {
+    // Simple case - just use the last user message (original behavior)
+    const userMessages = conversationMessages.filter(m => m.role === "user");
+    if (userMessages.length > 0) {
+      const lastUserMsg = userMessages[userMessages.length - 1];
+      parts.push(lastUserMsg?.content ?? "");
+    }
   }
   
-  return prompt;
+  return parts.join("\n\n");
 }
 
 function createErrorResponse(message: string, type: string = "invalid_request_error", status: number = 400): Response {
@@ -464,7 +508,8 @@ async function handleChatCompletions(req: Request, accessToken: string): Promise
     const encoder = new TextEncoder();
     let isClosed = false;
     let hasToolCalls = false;
-    let toolCallIndex = 0;
+    let toolCallIndex = 0; // For internal Cursor tool calls (built-in)
+    let mcpToolCallIndex = 0; // Separate counter for MCP tool calls emitted to OpenAI
     const toolCallIdMap: Map<string, number> = new Map(); // Map Cursor call IDs to OpenAI indices
     let toolExecutionCompleted = false;  // Track if we've completed tool execution
     let heartbeatCountAfterExec = 0;     // Count heartbeats after tool execution
@@ -652,7 +697,7 @@ async function handleChatCompletions(req: Request, accessToken: string): Promise
               } else if (execReq.type === 'mcp') {
                 // MCP tool call - convert to OpenAI format and emit
                 hasToolCalls = true;
-                const currentIndex = toolCallIndex++;
+                const currentIndex = mcpToolCallIndex++; // Use MCP-specific counter for OpenAI clients
                 
                 console.log("[DEBUG] MCP tool call:", {
                   toolName: execReq.toolName,
@@ -711,8 +756,13 @@ async function handleChatCompletions(req: Request, accessToken: string): Promise
                 controller.enqueue(encoder.encode(createSSEChunk(toolCallsFinishChunk)));
                 controller.enqueue(encoder.encode(createSSEDone()));
                 
+                // Close the stream immediately - client can now proceed
+                isClosed = true;
+                controller.close();
+                
                 // Wait for tool result to be submitted via /v1/tool_results
-                console.log("[DEBUG] Waiting for tool result submission...");
+                // This happens asynchronously - the OpenAI stream is already closed
+                console.log("[DEBUG] OpenAI stream closed, waiting for tool result submission...");
                 const toolResultData = await resultPromise;
                 console.log("[DEBUG] Tool result received:", toolResultData);
                 
