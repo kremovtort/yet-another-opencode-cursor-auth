@@ -54,3 +54,53 @@ Summary of how to call the Cursor API and present it as an OpenAI‐style `/v1/c
 - **Protos:** The Cursor agent bundle already includes generated Buf JS protos in `cursor-agent-restored-source-code/proto/dist/generated/aiserver/v1/*` (for example `aiserver_pb.js`, `chat_pb.js`, `aiserver_connect.js`). These exports cover the newer chat shapes (such as `StreamUnifiedChatRequestWithTools`, `StreamUnifiedChatResponse*`) and are imported directly by `cursor-agent-source/index.js`, so the bundle can build the expected payloads without shipping the raw `.proto` files.
 - **OpenAI shim impact:** The OpenAI-compatible fetch path is implemented, but our shim still hand-rolls the deprecated `StreamChat` payload. We need to swap it to the generated `StreamUnifiedChat*` requests from the bundled protos for live calls to succeed. Model listing and auth refresh do work.
 - **Unified protos reality:** The restored bundle does not actually expose `aiserver_pb` or `StreamUnifiedChat*` types as loadable modules—the webpack module table only includes `chat_pb`, `utils_pb`, and a handful of other services (analytics, background_composer, etc.). The standalone `chat_pb.js` file mutates globals and exports nothing, and the unified classes are absent. Without the real unified proto definitions (or a bundle that contains them), we cannot build the new chat payloads; attempts to load them via shims fall back to legacy `StreamChat`.
+
+## Tool Calling Architecture (Working!)
+
+### Overview
+
+The OpenAI-compatible server now supports **full tool calling** with OpenCode and other OpenAI-compatible clients. This required understanding how Cursor's Agent API handles tool execution differently from OpenAI's API.
+
+### Key Differences: Cursor vs OpenAI
+
+| Aspect | Cursor Agent API | OpenAI API |
+|--------|------------------|------------|
+| Stream lifecycle | Single persistent stream for entire conversation | New request for each turn |
+| Tool execution | Server requests client to execute, waits on same stream | Client receives tool_calls, executes, sends new request with results |
+| Built-in tools | `shell`, `read`, `ls`, `grep`, etc. executed via `exec_request` | N/A - all tools are custom |
+| Custom tools (MCP) | Sent as `exec_request` with `type: 'mcp'` | Sent as `tool_calls` in response |
+
+### Implementation Strategy
+
+When the client provides `tools` in the request, ALL `exec_request` messages from Cursor are converted to OpenAI `tool_calls` format:
+
+1. **Client sends request** with `tools` array (e.g., `bash`, `read`, `glob`, etc.)
+2. **Cursor model calls a tool** → Server receives `exec_request` (could be `type: 'shell'`, `type: 'read'`, `type: 'mcp'`, etc.)
+3. **Server emits `tool_calls`** chunk to client with the tool name and arguments
+4. **Server emits `finish_reason: "tool_calls"`** and closes the SSE stream
+5. **Client executes tool** locally (OpenCode handles this)
+6. **Client sends new request** with tool result as a message (`role: "tool"`)
+7. **Server formats conversation** with tool results and sends to Cursor
+8. **Model continues** generating response
+
+### Tool Name Mapping
+
+Cursor's built-in exec types are mapped to OpenAI tool names:
+
+| Cursor exec_request type | OpenAI tool name | Arguments |
+|--------------------------|------------------|-----------|
+| `shell` | `bash` | `{ command, cwd? }` |
+| `read` | `read` | `{ filePath }` |
+| `ls` | `list` | `{ path }` |
+| `grep` (with pattern) | `grep` | `{ pattern, path }` |
+| `grep` (with glob) | `glob` | `{ pattern, path }` |
+| `mcp` | Original tool name | Original args |
+
+### Message History Handling
+
+When the client sends a follow-up request with tool results, `messagesToPrompt()` formats the full conversation:
+
+```
+System: <system message>
+
+User: <original query>

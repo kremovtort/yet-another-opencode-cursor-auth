@@ -1,30 +1,83 @@
 # Tool Calling Investigation Summary
 
 **Date**: December 8, 2025
-**Status**: ✅ Tool execution working (shell, ls, read, grep/glob) - Heartbeat issue fix applied
+**Status**: ✅ **FULLY WORKING** - OpenAI-compatible tool calling with OpenCode
 
-## Latest Status (Session 7)
+## Latest Status (Session 8) - BREAKTHROUGH!
 
-### Fixed: Model Continuation After Tool Execution (Heartbeat Loop)
-The issue where the model got stuck in a heartbeat loop after tool execution has been addressed.
+### Full OpenAI-Compatible Tool Calling Now Working
 
-**Root Cause**:
-When executing built-in tools (`shell`, `ls`, `read`, `grep`, `request_context`), the client was sending the result (`ExecClientMessage`) but **not** closing the execution stream. The server continued waiting for more data on that execution stream, preventing the model from proceeding to generate text.
+The server now correctly translates between Cursor's Agent API and OpenAI's tool calling format, allowing OpenCode to work seamlessly with Cursor's AI models.
 
-**The Fix**:
-Modified `AgentServiceClient` methods (`sendShellResult`, `sendLsResult`, `sendReadResult`, `sendGrepResult`, `sendRequestContextResult`) to send an `ExecClientControlMessage` with `stream_close` immediately after sending the result. This matches the behavior already implemented in `sendToolResult` for MCP tools.
+**Key Achievement**: OpenCode can now use all its tools (bash, read, glob, grep, list, edit, write, task, etc.) through Cursor's API with full round-trip execution.
 
-**Code Changes**:
-- Updated `src/lib/api/agent-service.ts` to append a stream close message after every tool execution result.
+### The Solution
 
-### Added: MCP Tool Glue to OpenAI Client
-- `server.ts` now translates `exec_request` with `mcp_args` into OpenAI `tool_calls`, registers a pending map, and exposes `POST /v1/tool_results` to accept tool outputs from the caller.
-- Pending entries are keyed by the OpenAI tool_call_id and call `sendToolResult` (with stream_close) when the result arrives.
+When the client provides `tools` in the request, ALL `exec_request` messages from Cursor are converted to OpenAI `tool_calls` format instead of being executed locally:
 
-### Next Steps
-1. ⬜ Verify the fix with actual tool execution (using `scripts/test-exec-flow.ts` or running the server)
-2. ⬜ Implement proper `LsDirectoryTreeNode` format (currently sending simple string)
-3. ⬜ Test MCP tool round-trip (mcp_args → client → mcp_result)
+1. **Client sends request** with `tools` array
+2. **Cursor model calls a tool** → Server receives `exec_request` 
+3. **Server emits `tool_calls`** chunk and closes the SSE stream with `finish_reason: "tool_calls"`
+4. **Client (OpenCode) executes tool** locally
+5. **Client sends new request** with tool result as a message (`role: "tool"`)
+6. **Server formats conversation** with tool results and sends to Cursor
+7. **Model continues** generating response
+
+### Code Changes Made
+
+1. **`src/server.ts`** - Major refactor of exec_request handling:
+   - Added `clientProvidedTools` check to determine execution mode
+   - When tools are provided: emit ALL exec_requests as OpenAI tool_calls
+   - When no tools: execute built-in tools locally (legacy mode)
+   - Close stream immediately after emitting tool_calls (fixes hang issue)
+   - Added separate `mcpToolCallIndex` counter (fixes index=1 bug)
+
+2. **`src/server.ts:messagesToPrompt()`** - Full conversation history support:
+   - Handles `role: "tool"` messages with tool results
+   - Formats conversation with tool call history for model continuation
+   - Properly structures multi-turn conversations
+
+3. **`src/server.ts:handleToolResult()`** - Updated for all exec types:
+   - Now handles shell, read, ls, grep, and mcp result types
+   - Properly sends results back to Cursor in correct format
+
+### Tool Name Mapping
+
+| Cursor exec_request type | OpenAI tool name | Arguments |
+|--------------------------|------------------|-----------|
+| `shell` | `bash` | `{ command, cwd? }` |
+| `read` | `read` | `{ filePath }` |
+| `ls` | `list` | `{ path }` |
+| `grep` (with pattern) | `grep` | `{ pattern, path }` |
+| `grep` (with glob) | `glob` | `{ pattern, path }` |
+| `mcp` | Original tool name | Original args |
+
+### Test Results
+
+```
+=== OpenAI Multi-Turn Tool Calling Test ===
+
+1. Sending initial request...
+   Response 1:
+   - Content: "I'll check the weather in Tokyo..."
+   - Tool Calls: 1 - get_weather({"location":"Tokyo"})
+   - Finish Reason: tool_calls
+
+2. Executing tool locally (simulated)...
+
+3. Sending follow-up request with tool result...
+   Response 2 (continuation):
+   - Content: "Based on the weather data, here's the current weather in Tokyo:
+     - Temperature: 22°C
+     - Condition: Partly cloudy..."
+   - Finish Reason: stop
+
+SUCCESS! Multi-turn tool calling flow completed.
+```
+
+### OpenCode Integration Verified
+
+OpenCode with 40+ tools (bash, read, glob, grep, list, edit, write, task, webfetch, todowrite, chrome-devtools_*, etc.) now works correctly through the proxy server.
 
 ---
 
