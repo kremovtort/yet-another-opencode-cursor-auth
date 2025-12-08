@@ -868,63 +868,109 @@ The Cursor server behaves differently for **mid-turn tool results** vs **new con
 
 Our OpenAI-compatible proxy doesn't have access to this KV blob rendering logic.
 
-### Potential Solutions
+### Solution Options
 
-#### Option A: Don't Use Session Reuse for Tools (Simple)
+#### Option A: Don't Use Session Reuse for Tools (Simple) ✅ IMPLEMENTED
 
 For requests that will involve tool calls, always start fresh sessions. This matches how most OpenAI clients work anyway.
 
-**Pros:** Works immediately, no protocol changes needed
-**Cons:** Loses session continuity benefits, may be slower
+**Implementation:**
+- When client provides `tools` in the request, skip session reuse entirely
+- Always create a fresh Cursor session for tool-calling requests
+- Tool results come back as new requests with full conversation history
+- Server formats the history and sends as a fresh `AgentRunRequest`
 
-#### Option B: Extract Text from KV Blobs (Medium)
+**Pros:**
+- Works immediately, no protocol changes needed
+- Matches standard OpenAI client behavior
+- Simpler code path, easier to debug
+- More reliable - each request is independent
 
-Parse the JSON blobs stored in KV and extract the text response.
+**Cons:**
+- Loses session continuity benefits (context window sharing)
+- Slightly slower (new connection per request)
+- More API calls to Cursor backend
 
+**Code Change in `server.ts`:**
 ```typescript
-// In handleKvMessage:
-if (kvMsg.messageType === 'set_blob_args' && kvMsg.blobData) {
-  try {
-    const json = JSON.parse(new TextDecoder().decode(kvMsg.blobData));
-    if (json.role === 'assistant' && json.content) {
-      const text = extractTextFromContent(json.content);
-      if (text) yield { type: "text", content: text };
-    }
-  } catch {}
+// In streamWithSessionReuse():
+// Skip session reuse entirely when tools are provided
+const clientProvidedTools = Array.isArray(body.tools) && body.tools.length > 0;
+if (clientProvidedTools) {
+  // Always use fresh session for tool-calling flows
+  return legacyStreamResponse({ body, model, prompt, completionId, created, accessToken });
 }
 ```
 
-**Pros:** Keeps session reuse working
-**Cons:** Complex, timing issues (text arrives before turn_ended), may miss content
+#### Option B: Extract Text from KV Blobs (Medium) - DOCUMENTED FOR FUTURE
 
-#### Option C: Find the Continue Signal (Ideal) ⬅️ INVESTIGATING
+Parse the JSON blobs stored in KV and extract the text response. This would allow session reuse to work but requires more complex handling.
 
-There may be a message or signal we're not sending that tells the server to continue streaming instead of storing in KV.
+**Implementation Approach:**
+```typescript
+// In AgentServiceClient.chatStream(), modify handleKvMessage:
+private async *handleKvMessageWithTextExtraction(
+  kvMsg: KvServerMessage,
+  requestId: string,
+  appendSeqno: bigint
+): AsyncGenerator<AgentStreamChunk> {
+  // ... existing KV handling ...
+  
+  if (kvMsg.messageType === 'set_blob_args' && kvMsg.blobData) {
+    try {
+      const text = new TextDecoder().decode(kvMsg.blobData);
+      const json = JSON.parse(text);
+      
+      // Check if this is an assistant message blob
+      if (json.role === 'assistant' && json.content) {
+        const extractedText = extractTextFromContent(json.content);
+        if (extractedText) {
+          yield { type: "text", content: extractedText };
+        }
+      }
+    } catch {
+      // Not JSON or not an assistant message - ignore
+    }
+  }
+}
 
-**Candidates to investigate:**
-1. `ConversationAction` with a "continue" action after tool result
-2. Additional field in `ExecClientControlMessage` 
-3. Something in the checkpoint structure we need to echo back
-4. A different `RequestContext` field for continuation
+function extractTextFromContent(content: any): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(item => item.type === 'text')
+      .map(item => item.text || '')
+      .join('');
+  }
+  return '';
+}
+```
 
-### Investigation Notes
+**Challenges:**
+1. **Timing**: Text arrives via KV before `turn_ended` - need to buffer or emit immediately
+2. **Completeness**: May miss content if stored across multiple blobs
+3. **Thinking tags**: Response includes `<think>` blocks that should be filtered
+4. **No turn_ended**: Still won't receive turn_ended, need to detect completion differently
 
-**Fields we handle in AgentServerMessage:**
-- Field 1: `interaction_update` - text, tool calls, turn_ended
-- Field 2: `exec_server_message` - tool execution requests
-- Field 3: `conversation_checkpoint_update` - checkpoints
-- Field 4: `kv_server_message` - blob operations
-- Field 5: `exec_server_control_message` - abort signals (added)
-- Field 7: `interaction_query` - user approval requests (added)
+**Pros:**
+- Keeps session reuse working
+- Lower latency for multi-turn conversations
+- Shared context window across turns
 
-**Messages we send after tool result:**
-1. `ExecClientMessage` with `mcp_result`
-2. `ExecClientControlMessage` with `stream_close`
+**Cons:**
+- Complex implementation
+- Fragile - depends on KV blob format staying consistent
+- May have edge cases with partial content
 
-**What native Cursor client might send additionally:**
-- Need to investigate `ConversationAction` structure
-- Check if there's a "continue generation" action type
-- Look at how checkpoints are used in continuation
+#### Option C: Find the Continue Signal (Ideal) - NOT FOUND
+
+Investigated whether there's a message that triggers streaming instead of KV storage. **Conclusion: No such signal found.**
+
+**Investigation Results:**
+- `ConversationAction` has `ResumeAction` (field 2) but it's for connection loss recovery, not continuation
+- `ExecClientControlMessage` only has `stream_close` and `throw` - no "continue" option
+- Native Cursor client appears to use KV blobs for this flow (IDE renders from blobs)
+- The KV storage behavior seems intentional for checkpoint/resume functionality
 
 ### Test Commands
 
@@ -953,6 +999,15 @@ curl ... -d '{"messages": [{"role": "user", "content": "Weather?"}], "tools": [.
 curl ... -d '{"messages": [..., {"role": "tool", "tool_call_id": "sess_xxx__call_yyy", "content": "result"}]}'
 # Returns: empty response (text in KV only)
 ```
+
+### Final Decision
+
+**Implemented Option A** - Skip session reuse for tool-calling flows. This provides:
+- Reliable tool calling with OpenCode and other OpenAI-compatible clients
+- Simpler architecture with independent requests
+- No dependency on Cursor's internal KV blob format
+
+Option B is documented above for future reference if session reuse becomes critical for performance.
 
 ## Environment
 

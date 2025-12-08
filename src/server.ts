@@ -52,10 +52,28 @@ interface CursorSession extends SessionLike {
 }
 
 const cursorSessions = new Map<string, CursorSession>();
+const toolCallToSession = new Map<string, string>();
 const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes idle timeout
+const HEARTBEAT_IDLE_LIMIT = 30; // fall back to close after too many idle heartbeats
 
+function mapToolCallToSession(toolCallId: string, sessionId: string) {
+  toolCallToSession.set(toolCallId, sessionId);
+}
+
+function unmapToolCall(toolCallId: string) {
+  toolCallToSession.delete(toolCallId);
+}
+
+function clearSessionToolMappings(sessionId: string) {
+  for (const [tcId, sid] of toolCallToSession) {
+    if (sid === sessionId) {
+      toolCallToSession.delete(tcId);
+    }
+  }
+}
 
 interface OpenAIMessage {
+
   role: "system" | "user" | "assistant" | "tool";
   content: string | null;
   tool_calls?: OpenAIToolCall[];
@@ -517,11 +535,16 @@ function streamCursorSession(
       controller.enqueue(encoder.encode(createSSEChunk(initialChunk)));
 
       try {
+        let carryChunk: AgentStreamChunk | null = null;
         while (true) {
-          const { value, done } = await session.iterator.next();
+          const { value, done } = carryChunk
+            ? { value: carryChunk, done: false as const }
+            : await session.iterator.next();
+          carryChunk = null;
           session.lastActivity = Date.now();
 
           if (done || !value) {
+
             const finalChunk: OpenAIStreamChunk = {
               id: completionId,
               object: "chat.completion.chunk",
@@ -537,10 +560,12 @@ function streamCursorSession(
             };
             controller.enqueue(encoder.encode(createSSEChunk(finalChunk)));
             controller.enqueue(encoder.encode(createSSEDone()));
+            clearSessionToolMappings(session.id);
             cursorSessions.delete(session.id);
             controller.close();
             return;
           }
+
 
           const chunk = value as AgentStreamChunk;
 
@@ -560,19 +585,53 @@ function streamCursorSession(
             };
             controller.enqueue(encoder.encode(createSSEChunk(streamChunk)));
           } else if (chunk.type === "exec_request" && chunk.execRequest) {
-            // Convert exec_request into OpenAI tool_calls and park the Cursor stream
-            if (chunk.execRequest.type === "request_context") {
-              continue; // Skip metadata fetches
+            // Convert exec_request(s) into OpenAI tool_calls and park the Cursor stream.
+            const toolCalls: {
+              openaiToolCallId: string;
+              toolName: string;
+              toolArgs: Record<string, any>;
+              index: number;
+              execReq: ExecRequest;
+            }[] = [];
+
+            let currentChunk: AgentStreamChunk | null = chunk;
+            while (currentChunk && currentChunk.type === "exec_request" && currentChunk.execRequest) {
+              const execReq = currentChunk.execRequest;
+              if (execReq.type !== "request_context") {
+                const { toolName, toolArgs } = mapExecRequestToTool(execReq);
+                if (toolName && toolArgs) {
+                  const callBase = selectCallBase(execReq);
+                  const openaiToolCallId = makeToolCallId(session.id, callBase);
+                  session.pendingExecs.set(openaiToolCallId, execReq);
+                  mapToolCallToSession(openaiToolCallId, session.id);
+                  toolCalls.push({
+                    openaiToolCallId,
+                    toolName,
+                    toolArgs,
+                    index: toolCalls.length,
+                    execReq,
+                  });
+                }
+              }
+
+              const next = await session.iterator.next();
+              if (next.done || !next.value) {
+                currentChunk = null;
+                break;
+              }
+              if ((next.value as AgentStreamChunk).type === "exec_request") {
+                currentChunk = next.value as AgentStreamChunk;
+              } else {
+                carryChunk = next.value as AgentStreamChunk;
+                currentChunk = null;
+                break;
+              }
             }
 
-            const { toolName, toolArgs } = mapExecRequestToTool(chunk.execRequest);
-            if (!toolName || !toolArgs) {
+            if (toolCalls.length === 0) {
               continue;
             }
 
-            const callBase = selectCallBase(chunk.execRequest);
-            const openaiToolCallId = makeToolCallId(session.id, callBase);
-            session.pendingExecs.set(openaiToolCallId, chunk.execRequest);
             session.state = "waiting_tool";
             session.lastActivity = Date.now();
 
@@ -585,17 +644,15 @@ function streamCursorSession(
                 {
                   index: 0,
                   delta: {
-                    tool_calls: [
-                      {
-                        index: session.pendingExecs.size - 1,
-                        id: openaiToolCallId,
-                        type: "function",
-                        function: {
-                          name: toolName,
-                          arguments: JSON.stringify(toolArgs),
-                        },
+                    tool_calls: toolCalls.map((tc) => ({
+                      index: tc.index,
+                      id: tc.openaiToolCallId,
+                      type: "function",
+                      function: {
+                        name: tc.toolName,
+                        arguments: JSON.stringify(tc.toolArgs),
                       },
-                    ],
+                    })),
                   },
                   finish_reason: null,
                 },
@@ -634,6 +691,16 @@ function streamCursorSession(
             return;
           } else if (chunk.type === "heartbeat" || chunk.type === "checkpoint") {
             continue;
+          } else if (chunk.type === "exec_server_abort") {
+            // Server sent abort signal for exec - log and continue
+            console.log(`[Session ${session.id}] Received exec_server_abort from Cursor`);
+            continue;
+          } else if (chunk.type === "interaction_query") {
+            // Server is asking for user interaction (web search approval, etc.)
+            // For now, log it - we may need to auto-approve or handle differently
+            console.log(`[Session ${session.id}] Received interaction_query: id=${chunk.queryId}, type=${chunk.queryType}`);
+            // TODO: May need to send InteractionResponse back via BidiAppend
+            continue;
           } else if (chunk.type === "done") {
             const finalChunk: OpenAIStreamChunk = {
               id: completionId,
@@ -650,9 +717,11 @@ function streamCursorSession(
             };
             controller.enqueue(encoder.encode(createSSEChunk(finalChunk)));
             controller.enqueue(encoder.encode(createSSEDone()));
+            clearSessionToolMappings(session.id);
             cursorSessions.delete(session.id);
             controller.close();
             return;
+
           }
         }
       } catch (err: any) {
@@ -681,6 +750,18 @@ function streamCursorSession(
   return makeStreamResponse(readable);
 }
 
+/**
+ * DEPRECATED: Session reuse for tool-calling flows.
+ * 
+ * This function is currently NOT USED because BidiAppend-based session reuse
+ * doesn't work properly for tool results. When tool results are sent via
+ * BidiAppend, the model stores its response in KV blobs instead of streaming.
+ * 
+ * Kept here for future reference if we implement Option B (KV blob extraction).
+ * See docs/TOOL_CALLING_INVESTIGATION.md "Session 9" for details.
+ * 
+ * @deprecated Use legacyStreamResponse instead for all streaming requests
+ */
 async function streamWithSessionReuse(
   body: OpenAIChatRequest,
   model: string,
@@ -691,17 +772,72 @@ async function streamWithSessionReuse(
   const sessionIdFromHistory = findSessionIdInMessages(body.messages ?? []);
   const toolMessages = collectToolMessages(body.messages ?? []);
 
+  if (toolMessages.length > 0) {
+    const mappedId = toolMessages
+      .map((m) => (m.tool_call_id ? toolCallToSession.get(m.tool_call_id) : null))
+      .find((id): id is string => !!id);
+    if (mappedId) {
+      const mappedSession = cursorSessions.get(mappedId);
+      if (mappedSession) {
+        const sent = await sendToolResultsToCursor(mappedSession, toolMessages);
+        if (sent) {
+          toolMessages.forEach((m) => m.tool_call_id && unmapToolCall(m.tool_call_id));
+          mappedSession.state = "running";
+          mappedSession.lastActivity = Date.now();
+          console.log(
+            `[SESSION] Resuming via mapping ${mappedSession.id} model=${mappedSession.model ?? model} tools=${toolMessages.length}`
+          );
+          return streamCursorSession(mappedSession, mappedSession.model ?? model, mappedSession.completionId, true);
+        }
+        console.warn(`[SESSION] Failed to apply tool results via mapping for session ${mappedSession.id}`);
+      }
+    }
+  }
+
   if (sessionIdFromHistory) {
+
     const existing = cursorSessions.get(sessionIdFromHistory);
     if (existing && toolMessages.length > 0) {
       const sent = await sendToolResultsToCursor(existing, toolMessages);
       if (sent) {
+        toolMessages.forEach((m) => m.tool_call_id && unmapToolCall(m.tool_call_id));
         if (!existing.completionId) {
           existing.completionId = generateId();
         }
         existing.state = "running";
         existing.lastActivity = Date.now();
+        console.log(
+          `[SESSION] Resuming session ${existing.id} model=${existing.model ?? model} tools=${toolMessages.length}`
+        );
         return streamCursorSession(existing, existing.model ?? model, existing.completionId, true);
+      }
+      console.warn(`[SESSION] Failed to apply tool results for session ${existing.id}; starting fresh`);
+    } else if (!existing) {
+      console.warn(`[SESSION] Session ${sessionIdFromHistory} not found; starting new session`);
+    } else if (toolMessages.length === 0) {
+      console.warn(`[SESSION] No tool messages for session ${sessionIdFromHistory}; starting new session`);
+    }
+  }
+
+  // Fallback: try mapping from tool_call_id to session
+  if (toolMessages.length > 0) {
+    const mappedId = toolMessages
+      .map((m) => (m.tool_call_id ? toolCallToSession.get(m.tool_call_id) : null))
+      .find((id): id is string => !!id);
+    if (mappedId) {
+      const mappedSession = cursorSessions.get(mappedId);
+      if (mappedSession) {
+        const sent = await sendToolResultsToCursor(mappedSession, toolMessages);
+        if (sent) {
+          toolMessages.forEach((m) => m.tool_call_id && unmapToolCall(m.tool_call_id));
+          mappedSession.state = "running";
+          mappedSession.lastActivity = Date.now();
+          console.log(
+            `[SESSION] Resuming via mapping ${mappedSession.id} model=${mappedSession.model ?? model} tools=${toolMessages.length}`
+          );
+          return streamCursorSession(mappedSession, mappedSession.model ?? model, mappedSession.completionId, true);
+        }
+        console.warn(`[SESSION] Failed to apply tool results via mapping for session ${mappedSession.id}`);
       }
     }
   }
@@ -731,12 +867,375 @@ async function streamWithSessionReuse(
   };
 
   cursorSessions.set(sessionId, session);
+  console.log(
+    `[SESSION] New session ${sessionId} model=${model} tools=${(body.tools as any[] | undefined)?.length ?? 0}`
+  );
 
   return streamCursorSession(session, model, completionId, false);
 }
 
+// --- Legacy streaming (non-session) ---
+
+interface LegacyStreamParams {
+  body: OpenAIChatRequest;
+  model: string;
+  prompt: string;
+  completionId: string;
+  created: number;
+  accessToken: string;
+}
+
+async function legacyStreamResponse({ body, model, prompt, completionId, created, accessToken }: LegacyStreamParams): Promise<Response> {
+  const client = createAgentServiceClient(accessToken);
+  const encoder = new TextEncoder();
+  let isClosed = false;
+  let hasToolCalls = false;
+  let toolCallIndex = 0; // For internal Cursor tool calls (built-in)
+  let mcpToolCallIndex = 0; // Separate counter for MCP tool calls emitted to OpenAI
+  const toolCallIdMap: Map<string, number> = new Map(); // Map Cursor call IDs to OpenAI indices
+  let toolExecutionCompleted = false; // Track if we've completed tool execution
+  let heartbeatCountAfterExec = 0; // Count heartbeats after tool execution
+
+  const readable = new ReadableStream({
+    async start(controller) {
+      try {
+        // Send initial chunk with role
+        const initialChunk: OpenAIStreamChunk = {
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model: body.model ?? "gpt-4o",
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant" },
+              finish_reason: null,
+            },
+          ],
+        };
+        controller.enqueue(encoder.encode(createSSEChunk(initialChunk)));
+
+        // Stream content
+        const tools = body.tools as OpenAIToolDefinition[] | undefined;
+        for await (const chunk of client.chatStream({ message: prompt, model, mode: AgentMode.AGENT, tools })) {
+          if (isClosed) break;
+
+          if (chunk.type === "text" || chunk.type === "token") {
+            if (chunk.content) {
+              const streamChunk: OpenAIStreamChunk = {
+                id: completionId,
+                object: "chat.completion.chunk",
+                created,
+                model: body.model ?? "gpt-4o",
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: chunk.content },
+                    finish_reason: null,
+                  },
+                ],
+              };
+              controller.enqueue(encoder.encode(createSSEChunk(streamChunk)));
+            }
+          } else if (chunk.type === "tool_call_started" && chunk.toolCall) {
+            // Tool call started - we handle these internally via exec_requests
+            console.log(`[DEBUG] Tool call started: ${chunk.toolCall.name} (handled internally)`);
+            toolCallIdMap.set(chunk.toolCall.callId, toolCallIndex++);
+          } else if (chunk.type === "partial_tool_call" && chunk.toolCall && chunk.partialArgs) {
+            console.log(`[DEBUG] Partial tool call for: ${chunk.toolCall.callId}`);
+          } else if (chunk.type === "tool_call_completed" && chunk.toolCall) {
+            console.log(`[DEBUG] Tool call completed: ${chunk.toolCall.name}`);
+          } else if (chunk.type === "exec_request" && chunk.execRequest) {
+            const execReq = chunk.execRequest;
+            console.log("[DEBUG] Received exec_request:", { type: execReq.type, id: execReq.id });
+
+            const toolsProvided = tools && tools.length > 0;
+
+            if (toolsProvided && execReq.type !== "request_context") {
+              hasToolCalls = true;
+              const currentIndex = mcpToolCallIndex++;
+
+              let toolName: string;
+              let toolArgs: Record<string, any>;
+
+              if (execReq.type === "shell") {
+                toolName = "bash";
+                toolArgs = { command: execReq.command };
+                if (execReq.cwd) toolArgs.cwd = execReq.cwd;
+              } else if (execReq.type === "read") {
+                toolName = "read";
+                toolArgs = { filePath: execReq.path };
+              } else if (execReq.type === "ls") {
+                toolName = "list";
+                toolArgs = { path: execReq.path };
+              } else if (execReq.type === "grep") {
+                toolName = execReq.glob ? "glob" : "grep";
+                toolArgs = execReq.glob
+                  ? { pattern: execReq.glob, path: execReq.path }
+                  : { pattern: execReq.pattern, path: execReq.path };
+              } else if (execReq.type === "mcp") {
+                toolName = execReq.toolName;
+                toolArgs = execReq.args;
+              } else {
+                console.log(`[DEBUG] Unknown exec type ${(execReq as any).type}, skipping`);
+                continue;
+              }
+
+              console.log(`[DEBUG] Emitting tool_call to client: ${toolName}(${JSON.stringify(toolArgs)})`);
+
+              const callIdBase = execReq.type === "mcp" ? execReq.toolCallId : execReq.execId || String(execReq.id);
+              const openaiToolCallId = `call_${callIdBase.replace(/-/g, "").slice(0, 24)}`;
+
+              const toolCallChunk: OpenAIStreamChunk = {
+                id: completionId,
+                object: "chat.completion.chunk",
+                created,
+                model: body.model ?? "gpt-4o",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: currentIndex,
+                          id: openaiToolCallId,
+                          type: "function",
+                          function: {
+                            name: toolName,
+                            arguments: JSON.stringify(toolArgs),
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              };
+              controller.enqueue(encoder.encode(createSSEChunk(toolCallChunk)));
+
+              const toolCallsFinishChunk: OpenAIStreamChunk = {
+                id: completionId,
+                object: "chat.completion.chunk",
+                created,
+                model: body.model ?? "gpt-4o",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {},
+                    finish_reason: "tool_calls",
+                  },
+                ],
+              };
+              controller.enqueue(encoder.encode(createSSEChunk(toolCallsFinishChunk)));
+              controller.enqueue(encoder.encode(createSSEDone()));
+
+              isClosed = true;
+              controller.close();
+
+              console.log("[DEBUG] OpenAI stream closed. Client will send tool results in new request.");
+              return;
+            } else if (execReq.type === "shell") {
+              console.log(`[DEBUG] Executing shell command: ${execReq.command}`);
+              const startTime = Date.now();
+              const cwd = execReq.cwd || process.cwd();
+              try {
+                const proc = Bun.spawn(["sh", "-c", execReq.command], { cwd, stdout: "pipe", stderr: "pipe" });
+                const stdout = await new Response(proc.stdout).text();
+                const stderr = await new Response(proc.stderr).text();
+                const exitCode = await proc.exited;
+                const executionTimeMs = Date.now() - startTime;
+                console.log(`[DEBUG] Shell result (exit=${exitCode}): ${(stdout + stderr).slice(0, 200)}`);
+
+                await client.sendShellResult(execReq.id, execReq.execId, execReq.command, cwd, stdout, stderr, exitCode, executionTimeMs);
+                console.log("[DEBUG] Sent shell result");
+                toolExecutionCompleted = true;
+              } catch (err: any) {
+                console.error("[ERROR] Shell execution failed:", err.message);
+                const executionTimeMs = Date.now() - startTime;
+                await client.sendShellResult(execReq.id, execReq.execId, execReq.command, cwd, "", `Error: ${err.message}`, 1, executionTimeMs);
+                toolExecutionCompleted = true;
+              }
+            } else if (execReq.type === "read") {
+              console.log(`[DEBUG] Reading file: ${execReq.path}`);
+              try {
+                const file = Bun.file(execReq.path);
+                const content = await file.text();
+                const stats = await file.stat();
+                const totalLines = content.split("\n").length;
+                await client.sendReadResult(execReq.id, execReq.execId, content, execReq.path, totalLines, BigInt(stats.size), false);
+                console.log("[DEBUG] Sent read result");
+                toolExecutionCompleted = true;
+              } catch (err: any) {
+                console.error("[ERROR] Read failed:", err.message);
+                await client.sendReadResult(execReq.id, execReq.execId, `Error: ${err.message}`, execReq.path, 0, 0n, false);
+                toolExecutionCompleted = true;
+              }
+            } else if (execReq.type === "ls") {
+              console.log(`[DEBUG] Listing directory: ${execReq.path}`);
+              try {
+                const entries = await (Bun.file(execReq.path) as any).dir();
+                const files = (entries as { name: string }[]).map((e) => e.name).join("\n");
+                await client.sendLsResult(execReq.id, execReq.execId, files);
+                console.log("[DEBUG] Sent ls result");
+                toolExecutionCompleted = true;
+              } catch (err: any) {
+                console.error("[ERROR] ls failed:", err.message);
+                await client.sendLsResult(execReq.id, execReq.execId, `Error: ${err.message}`);
+                toolExecutionCompleted = true;
+              }
+            } else if (execReq.type === "grep") {
+              console.log(`[DEBUG] grep/glob request: pattern=${execReq.pattern || execReq.glob}, path=${execReq.path || process.cwd()}`);
+              try {
+                let files: string[] = [];
+                if (execReq.glob) {
+                  const globber = new Bun.Glob(execReq.glob);
+                  files = Array.from(globber.scanSync(execReq.path || process.cwd()));
+                } else if (execReq.pattern) {
+                  const rg = Bun.spawn(["rg", "-l", execReq.pattern, execReq.path || process.cwd()], { stdout: "pipe", stderr: "pipe" });
+                  const stdout = await new Response(rg.stdout).text();
+                  files = stdout.split("\n").filter((f) => f.length > 0);
+                }
+                await client.sendGrepResult(execReq.id, execReq.execId, execReq.pattern || execReq.glob || "", execReq.path || process.cwd(), files);
+                console.log("[DEBUG] Sent grep result");
+                toolExecutionCompleted = true;
+              } catch (err: any) {
+                console.error("[ERROR] grep/glob failed:", err.message);
+                await client.sendGrepResult(execReq.id, execReq.execId, execReq.pattern || execReq.glob || "", execReq.path || process.cwd(), []);
+                toolExecutionCompleted = true;
+              }
+            } else if (execReq.type === "mcp") {
+              console.log(`[DEBUG] MCP exec request: ${execReq.name}`);
+              pendingToolResults.set(execReq.toolCallId, { execRequest: execReq, client });
+              const toolCallChunk: OpenAIStreamChunk = {
+                id: completionId,
+                object: "chat.completion.chunk",
+                created,
+                model: body.model ?? "gpt-4o",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: execReq.toolCallId,
+                          type: "function",
+                          function: {
+                            name: execReq.toolName,
+                            arguments: JSON.stringify(execReq.args),
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              };
+              controller.enqueue(encoder.encode(createSSEChunk(toolCallChunk)));
+
+              const toolCallsFinishChunk: OpenAIStreamChunk = {
+                id: completionId,
+                object: "chat.completion.chunk",
+                created,
+                model: body.model ?? "gpt-4o",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {},
+                    finish_reason: "tool_calls",
+                  },
+                ],
+              };
+              controller.enqueue(encoder.encode(createSSEChunk(toolCallsFinishChunk)));
+              controller.enqueue(encoder.encode(createSSEDone()));
+              isClosed = true;
+              controller.close();
+              console.log("[DEBUG] OpenAI stream closed for MCP tool. Waiting for tool result...");
+              return;
+            }
+          } else if (chunk.type === "heartbeat") {
+            if (toolExecutionCompleted) {
+              heartbeatCountAfterExec++;
+              if (heartbeatCountAfterExec >= 10) {
+                console.log("[DEBUG] Closing stream after heartbeat threshold post tool execution");
+                break;
+              }
+            }
+          } else if (chunk.type === "checkpoint") {
+            continue;
+          } else if (chunk.type === "exec_server_abort") {
+            console.log("[DEBUG] Received exec_server_abort from Cursor");
+            continue;
+          } else if (chunk.type === "interaction_query") {
+            console.log(`[DEBUG] Received interaction_query: id=${chunk.queryId}, type=${chunk.queryType}`);
+            continue;
+          } else if (chunk.type === "done") {
+            break;
+          } else if (chunk.type === "error") {
+            console.error("Cursor stream error:", chunk.error);
+            const errorChunk: OpenAIStreamChunk = {
+              id: completionId,
+              object: "chat.completion.chunk",
+              created,
+              model: body.model ?? "gpt-4o",
+              choices: [
+                {
+                  index: 0,
+                  delta: { content: chunk.error ?? "Unknown error" },
+                  finish_reason: "stop",
+                },
+              ],
+            };
+            controller.enqueue(encoder.encode(createSSEChunk(errorChunk)));
+            break;
+          }
+        }
+
+        // Send final chunk
+        if (!isClosed) {
+          const finalChunk: OpenAIStreamChunk = {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model: body.model ?? "gpt-4o",
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason: hasToolCalls ? "tool_calls" : "stop",
+              },
+            ],
+          };
+          controller.enqueue(encoder.encode(createSSEChunk(finalChunk)));
+
+          // Send done signal
+          controller.enqueue(encoder.encode(createSSEDone()));
+          isClosed = true;
+          controller.close();
+        }
+      } catch (err: any) {
+        console.error("Stream error:", err);
+        if (!isClosed) {
+          isClosed = true;
+          try {
+            controller.error(err);
+          } catch {
+            // Controller may already be in error state
+          }
+        }
+      }
+    },
+    cancel() {
+      isClosed = true;
+    },
+  });
+
+  return makeStreamResponse(readable);
+}
+
 // --- Server ---
 
+// Session reuse handler defined above
 async function getAccessToken(): Promise<string> {
   // First check environment variable
   const envToken = process.env.CURSOR_ACCESS_TOKEN;
@@ -755,422 +1254,85 @@ async function getAccessToken(): Promise<string> {
 
 async function handleChatCompletions(req: Request, accessToken: string): Promise<Response> {
   let body: OpenAIChatRequest;
-  
+
   try {
-    body = await req.json() as OpenAIChatRequest;
+    body = (await req.json()) as OpenAIChatRequest;
   } catch {
     return createErrorResponse("Invalid JSON body");
   }
-  
-  // Validate required fields
+
   if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
     return createErrorResponse("messages is required and must be a non-empty array");
   }
-  
-  // Fetch available models and resolve the requested model
+
   let model: string;
   try {
     const models = await fetchUsableModels(accessToken);
     model = resolveModel(body.model ?? "auto", models);
   } catch (err) {
-    // If model fetching fails, use the requested model as-is
     console.warn("Failed to fetch models, using requested model directly:", err);
     model = body.model ?? "default";
   }
-  
+
   const stream = body.stream ?? false;
   const clientProvidedTools = Array.isArray(body.tools) && body.tools.length > 0;
 
-  if (stream && clientProvidedTools) {
-    return await streamWithSessionReuse(body, model, accessToken);
-  }
+  // NOTE: We intentionally DON'T use session reuse for tool-calling flows.
+  // 
+  // When tool results are sent via BidiAppend to an existing Cursor stream,
+  // the model stores its response in KV blobs instead of streaming it back.
+  // Only heartbeats are received, no text_delta, and no turn_ended.
+  // 
+  // The workaround is to always use fresh sessions for tool-calling flows.
+  // Tool results come back as new requests with full conversation history,
+  // which works correctly (Flow A in TOOL_CALLING_INVESTIGATION.md).
+  //
+  // See docs/TOOL_CALLING_INVESTIGATION.md "Session 9" for full details.
+  // Option B (extract text from KV blobs) is documented there for future reference.
 
   const prompt = messagesToPrompt(body.messages);
   const completionId = generateId();
   const created = Math.floor(Date.now() / 1000);
-  
-  if (stream) {
-    // Streaming response (no client-provided tool reuse)
-    const client = createAgentServiceClient(accessToken);
-    const encoder = new TextEncoder();
-    let isClosed = false;
-    let hasToolCalls = false;
-    let toolCallIndex = 0; // For internal Cursor tool calls (built-in)
-    let mcpToolCallIndex = 0; // Separate counter for MCP tool calls emitted to OpenAI
-    const toolCallIdMap: Map<string, number> = new Map(); // Map Cursor call IDs to OpenAI indices
-    let toolExecutionCompleted = false;  // Track if we've completed tool execution
-    let heartbeatCountAfterExec = 0;     // Count heartbeats after tool execution
-    
-    const readable = new ReadableStream({
-      async start(controller) {
-        try {
-          // Send initial chunk with role
-          const initialChunk: OpenAIStreamChunk = {
-            id: completionId,
-            object: "chat.completion.chunk",
-            created,
-            model: body.model ?? "gpt-4o",
-            choices: [{
-              index: 0,
-              delta: { role: "assistant" },
-              finish_reason: null,
-            }],
-          };
-          controller.enqueue(encoder.encode(createSSEChunk(initialChunk)));
-          
-          // Stream content
-          const tools = body.tools as OpenAIToolDefinition[] | undefined;
-          for await (const chunk of client.chatStream({ message: prompt, model, mode: AgentMode.AGENT, tools })) {
-            if (isClosed) break;
-            
-            if (chunk.type === "text" || chunk.type === "token") {
-              if (chunk.content) {
-                const streamChunk: OpenAIStreamChunk = {
-                  id: completionId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: body.model ?? "gpt-4o",
-                  choices: [{
-                    index: 0,
-                    delta: { content: chunk.content },
-                    finish_reason: null,
-                  }],
-                };
-                controller.enqueue(encoder.encode(createSSEChunk(streamChunk)));
-              }
-            } else if (chunk.type === "tool_call_started" && chunk.toolCall) {
-              // Tool call started - we handle these internally via exec_requests
-              // Don't emit to OpenAI client since we execute them locally
-              console.log(`[DEBUG] Tool call started: ${chunk.toolCall.name} (handled internally)`);
-              toolCallIdMap.set(chunk.toolCall.callId, toolCallIndex++);
-            } else if (chunk.type === "partial_tool_call" && chunk.toolCall && chunk.partialArgs) {
-              // Partial tool call arguments - ignore since we handle via exec_requests
-              // Just log for debugging
-              console.log(`[DEBUG] Partial tool call for: ${chunk.toolCall.callId}`);
-            } else if (chunk.type === "tool_call_completed" && chunk.toolCall) {
-              // Tool call completed - we'll get the actual execution via exec_request
-              console.log(`[DEBUG] Tool call completed: ${chunk.toolCall.name}`);
-            } else if (chunk.type === "exec_request" && chunk.execRequest) {
-              // Server is requesting tool execution
-              const execReq = chunk.execRequest;
-              
-              console.log("[DEBUG] Received exec_request:", {
-                type: execReq.type,
-                id: execReq.id,
-              });
-              
-              // If client provided tools, emit ALL exec_requests as tool_calls for client to execute
-              // This is the OpenAI-compatible mode
-              const toolsProvided = tools && tools.length > 0;
-              
-              if (toolsProvided && execReq.type !== 'request_context') {
-                // Convert built-in exec_request to OpenAI tool_call format
-                hasToolCalls = true;
-                const currentIndex = mcpToolCallIndex++;
-                
-                // Determine tool name and arguments based on exec type
-                let toolName: string;
-                let toolArgs: Record<string, any>;
-                
-                if (execReq.type === 'shell') {
-                  toolName = 'bash';
-                  toolArgs = { command: execReq.command };
-                  if (execReq.cwd) toolArgs.cwd = execReq.cwd;
-                } else if (execReq.type === 'read') {
-                  toolName = 'read';
-                  toolArgs = { filePath: execReq.path };
-                } else if (execReq.type === 'ls') {
-                  toolName = 'list';
-                  toolArgs = { path: execReq.path };
-                } else if (execReq.type === 'grep') {
-                  toolName = execReq.glob ? 'glob' : 'grep';
-                  toolArgs = execReq.glob 
-                    ? { pattern: execReq.glob, path: execReq.path }
-                    : { pattern: execReq.pattern, path: execReq.path };
-                } else if (execReq.type === 'mcp') {
-                  toolName = execReq.toolName;
-                  toolArgs = execReq.args;
-                } else {
-                  // Unknown type - skip
-                  console.log(`[DEBUG] Unknown exec type ${(execReq as any).type}, skipping`);
-                  continue;
-                }
-                
-                console.log(`[DEBUG] Emitting tool_call to client: ${toolName}(${JSON.stringify(toolArgs)})`);
-                
-                // Generate OpenAI-style tool call ID
-                const callIdBase = execReq.type === 'mcp' ? execReq.toolCallId : execReq.execId || String(execReq.id);
-                const openaiToolCallId = `call_${callIdBase.replace(/-/g, "").slice(0, 24)}`;
-                
-                // Send tool call chunk to OpenAI client
-                const toolCallChunk: OpenAIStreamChunk = {
-                  id: completionId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: body.model ?? "gpt-4o",
-                  choices: [{
-                    index: 0,
-                    delta: {
-                      tool_calls: [{
-                        index: currentIndex,
-                        id: openaiToolCallId,
-                        type: "function",
-                        function: {
-                          name: toolName,
-                          arguments: JSON.stringify(toolArgs),
-                        },
-                      }],
-                    },
-                    finish_reason: null,
-                  }],
-                };
-                controller.enqueue(encoder.encode(createSSEChunk(toolCallChunk)));
-                
-                // End the OpenAI stream with tool_calls finish reason
-                const toolCallsFinishChunk: OpenAIStreamChunk = {
-                  id: completionId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: body.model ?? "gpt-4o",
-                  choices: [{
-                    index: 0,
-                    delta: {},
-                    finish_reason: "tool_calls",
-                  }],
-                };
-                controller.enqueue(encoder.encode(createSSEChunk(toolCallsFinishChunk)));
-                controller.enqueue(encoder.encode(createSSEDone()));
-                
-                // Close the OpenAI stream immediately - client (OpenCode) can now proceed
-                // The client will execute the tool and send results in a NEW request with
-                // role: "tool" messages. We don't need to wait here - the new request will
-                // create a fresh conversation with Cursor including the tool results.
-                isClosed = true;
-                controller.close();
-                
-                console.log("[DEBUG] OpenAI stream closed. Client will send tool results in new request.");
-                return; // Exit the stream handler - we're done with this request
-                
-              } else if (execReq.type === 'shell') {
-                // Execute shell command locally
-                console.log(`[DEBUG] Executing shell command: ${execReq.command}`);
-                const startTime = Date.now();
-                const cwd = execReq.cwd || process.cwd();
-                try {
-                  const proc = Bun.spawn(['sh', '-c', execReq.command], {
-                    cwd,
-                    stdout: 'pipe',
-                    stderr: 'pipe',
-                  });
-                  const stdout = await new Response(proc.stdout).text();
-                  const stderr = await new Response(proc.stderr).text();
-                  const exitCode = await proc.exited;
-                  const executionTimeMs = Date.now() - startTime;
-                  console.log(`[DEBUG] Shell result (exit=${exitCode}): ${(stdout + stderr).slice(0, 200)}`);
-                  
-                  await client.sendShellResult(execReq.id, execReq.execId, execReq.command, cwd, stdout, stderr, exitCode, executionTimeMs);
-                  console.log("[DEBUG] Sent shell result");
-                  toolExecutionCompleted = true;
-                } catch (err: any) {
-                  console.error("[ERROR] Shell execution failed:", err.message);
-                  const executionTimeMs = Date.now() - startTime;
-                  await client.sendShellResult(execReq.id, execReq.execId, execReq.command, cwd, "", `Error: ${err.message}`, 1, executionTimeMs);
-                  toolExecutionCompleted = true;
-                }
-              } else if (execReq.type === 'read') {
-                console.log(`[DEBUG] Reading file: ${execReq.path}`);
-                try {
-                  const file = Bun.file(execReq.path);
-                  const content = await file.text();
-                  const stats = await file.stat();
-                  const totalLines = content.split('\n').length;
-                  await client.sendReadResult(execReq.id, execReq.execId, content, execReq.path, totalLines, BigInt(stats.size), false);
-                  console.log("[DEBUG] Sent read result");
-                  toolExecutionCompleted = true;
-                } catch (err: any) {
-                  console.error("[ERROR] Read failed:", err.message);
-                  await client.sendReadResult(execReq.id, execReq.execId, `Error: ${err.message}`, execReq.path, 0, 0n, false);
-                  toolExecutionCompleted = true;
-                }
-              } else if (execReq.type === 'ls') {
-                console.log(`[DEBUG] Listing directory: ${execReq.path}`);
-                try {
-                  const entries = await (Bun.file(execReq.path) as any).dir();
-                  const files = (entries as { name: string }[]).map((e) => e.name).join("\n");
-                  await client.sendLsResult(execReq.id, execReq.execId, files);
-                  console.log("[DEBUG] Sent ls result");
-                  toolExecutionCompleted = true;
-                } catch (err: any) {
-                  console.error("[ERROR] ls failed:", err.message);
-                  await client.sendLsResult(execReq.id, execReq.execId, `Error: ${err.message}`);
-                  toolExecutionCompleted = true;
-                }
-              } else if (execReq.type === 'grep') {
-                console.log(`[DEBUG] grep/glob request: pattern=${execReq.pattern || execReq.glob}, path=${execReq.path || process.cwd()}`);
-                try {
-                  let files: string[] = [];
-                  if (execReq.glob) {
-                    const globber = new Bun.Glob(execReq.glob);
-                    files = Array.from(globber.scanSync(execReq.path || process.cwd()));
-                  } else if (execReq.pattern) {
-                    const rg = Bun.spawn(['rg', '-l', execReq.pattern, execReq.path || process.cwd()], {
-                      stdout: 'pipe',
-                      stderr: 'pipe',
-                    });
-                    const stdout = await new Response(rg.stdout).text();
-                    files = stdout.split('\n').filter(f => f.length > 0);
-                  }
-                  await client.sendGrepResult(execReq.id, execReq.execId, execReq.pattern || execReq.glob || '', execReq.path || process.cwd(), files);
-                  console.log("[DEBUG] Sent grep result");
-                  toolExecutionCompleted = true;
-                } catch (err: any) {
-                  console.error("[ERROR] grep/glob failed:", err.message);
-                  await client.sendGrepResult(execReq.id, execReq.execId, execReq.pattern || execReq.glob || '', execReq.path || process.cwd(), []);
-                  toolExecutionCompleted = true;
-                }
-              } else if (execReq.type === 'mcp') {
-                console.log(`[DEBUG] MCP exec request: ${execReq.name}`);
-                pendingToolResults.set(execReq.toolCallId, { execRequest: execReq, client });
-                // Emit tool_call to client to execute MCP tool
-                const toolCallChunk: OpenAIStreamChunk = {
-                  id: completionId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: body.model ?? "gpt-4o",
-                  choices: [{
-                    index: 0,
-                    delta: {
-                      tool_calls: [{
-                        index: 0,
-                        id: execReq.toolCallId,
-                        type: "function",
-                        function: {
-                          name: execReq.toolName,
-                          arguments: JSON.stringify(execReq.args),
-                        },
-                      }],
-                    },
-                    finish_reason: null,
-                  }],
-                };
-                controller.enqueue(encoder.encode(createSSEChunk(toolCallChunk)));
-                
-                // End the stream with tool_calls finish reason
-                const toolCallsFinishChunk: OpenAIStreamChunk = {
-                  id: completionId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: body.model ?? "gpt-4o",
-                  choices: [{
-                    index: 0,
-                    delta: {},
-                    finish_reason: "tool_calls",
-                  }],
-                };
-                controller.enqueue(encoder.encode(createSSEChunk(toolCallsFinishChunk)));
-                controller.enqueue(encoder.encode(createSSEDone()));
-                isClosed = true;
-                controller.close();
-                console.log("[DEBUG] OpenAI stream closed for MCP tool. Waiting for tool result...");
-                return;
-              }
-            } else if (chunk.type === "heartbeat") {
 
-              // Heartbeat received - model is still thinking/working
-              if (toolExecutionCompleted) {
-                heartbeatCountAfterExec++;
-                console.log(`[DEBUG] Heartbeat after tool execution: ${heartbeatCountAfterExec}`);
-                // After 10 heartbeats post-exec without text, assume the model is done
-                // (This is a heuristic - the model should send turn_ended but sometimes doesn't)
-                if (heartbeatCountAfterExec >= 10) {
-                  console.log("[DEBUG] Ending stream after 10 heartbeats post-exec");
-                  break;
-                }
-              }
-            }
-          }
-          
-          if (!isClosed) {
-            // Send final chunk with finish_reason
-            const finalChunk: OpenAIStreamChunk = {
-              id: completionId,
-              object: "chat.completion.chunk",
-              created,
-              model: body.model ?? "gpt-4o",
-              choices: [{
-                index: 0,
-                delta: {},
-                finish_reason: hasToolCalls ? "tool_calls" : "stop",
-              }],
-            };
-            controller.enqueue(encoder.encode(createSSEChunk(finalChunk)));
-            
-            // Send done signal
-            controller.enqueue(encoder.encode(createSSEDone()));
-            isClosed = true;
-            controller.close();
-          }
-        } catch (err: any) {
-          console.error("Stream error:", err);
-          if (!isClosed) {
-            isClosed = true;
-            try {
-              controller.error(err);
-            } catch {
-              // Controller may already be in error state
-            }
-          }
-        }
-      },
-      cancel() {
-        isClosed = true;
-      }
-    });
-    
-    return new Response(readable, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-      },
-    });
-  } else {
-    // Non-streaming response
-    try {
-      const client = createAgentServiceClient(accessToken);
-      const tools = body.tools as OpenAIToolDefinition[] | undefined;
-      const content = await client.chat({ message: prompt, model, mode: AgentMode.AGENT, tools });
-      
-      const response: OpenAIChatResponse = {
-        id: completionId,
-        object: "chat.completion",
-        created,
-        model: body.model ?? "gpt-4o",
-        choices: [{
+  if (stream) {
+    return legacyStreamResponse({ body, model, prompt, completionId, created, accessToken });
+  }
+
+  try {
+    const client = createAgentServiceClient(accessToken);
+    const tools = body.tools as OpenAIToolDefinition[] | undefined;
+    const content = await client.chat({ message: prompt, model, mode: AgentMode.AGENT, tools });
+
+    const response: OpenAIChatResponse = {
+      id: completionId,
+      object: "chat.completion",
+      created,
+      model: body.model ?? "gpt-4o",
+      choices: [
+        {
           index: 0,
           message: {
             role: "assistant",
             content,
           },
           finish_reason: "stop",
-        }],
-        usage: {
-          prompt_tokens: Math.ceil(prompt.length / 4),
-          completion_tokens: Math.ceil(content.length / 4),
-          total_tokens: Math.ceil((prompt.length + content.length) / 4),
         },
-      };
-      
-      return new Response(JSON.stringify(response), {
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
-    } catch (err: any) {
-      return createErrorResponse(err.message ?? "Unknown error", "server_error", 500);
-    }
+      ],
+      usage: {
+        prompt_tokens: Math.ceil(prompt.length / 4),
+        completion_tokens: Math.ceil(content.length / 4),
+        total_tokens: Math.ceil((prompt.length + content.length) / 4),
+      },
+    };
+
+    return new Response(JSON.stringify(response), {
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  } catch (err: any) {
+    return createErrorResponse(err.message ?? "Unknown error", "server_error", 500);
   }
 }
 

@@ -1757,12 +1757,14 @@ export interface ToolCallInfo {
 }
 
 export interface AgentStreamChunk {
-  type: "text" | "thinking" | "token" | "checkpoint" | "done" | "error" | "tool_call_started" | "tool_call_completed" | "partial_tool_call" | "exec_request" | "heartbeat";
+  type: "text" | "thinking" | "token" | "checkpoint" | "done" | "error" | "tool_call_started" | "tool_call_completed" | "partial_tool_call" | "exec_request" | "heartbeat" | "exec_server_abort" | "interaction_query";
   content?: string;
   error?: string;
   toolCall?: ToolCallInfo;
   partialArgs?: string;   // For partial_tool_call updates
   execRequest?: ExecRequest;  // For exec_request chunks - tool execution needed
+  queryId?: number;       // For interaction_query - the query ID to respond with
+  queryType?: string;     // For interaction_query - web_search, ask_question, switch_mode, etc.
 }
 
 // --- Agent Service Client ---
@@ -2217,6 +2219,19 @@ export class AgentServiceClient {
     const buildTime = Date.now() - startTime;
 
     let appendSeqno = 0n;
+    // Heartbeats are frequent; be generous to avoid premature turn cuts
+    const HEARTBEAT_IDLE_MS_PROGRESS = 120000; // 2 minutes idle after progress
+    const HEARTBEAT_MAX_PROGRESS = 1000; // generous beat budget once progress observed
+    const HEARTBEAT_IDLE_MS_NOPROGRESS = 180000; // 3 minutes before first progress
+    const HEARTBEAT_MAX_NOPROGRESS = 1000;
+    let lastProgressAt = Date.now();
+    let heartbeatSinceProgress = 0;
+    let hasProgress = false;
+    const markProgress = () => {
+      heartbeatSinceProgress = 0;
+      lastProgressAt = Date.now();
+      hasProgress = true;
+    };
 
     // Store for tool result submission
     this.currentRequestId = requestId;
@@ -2329,6 +2344,7 @@ export class AgentServiceClient {
                   // Yield text content
                   if (parsed.text) {
                     yield { type: "text", content: parsed.text };
+                    markProgress();
                   }
 
                   // Yield tool call started
@@ -2343,6 +2359,7 @@ export class AgentServiceClient {
                         arguments: parsed.toolCallStarted.arguments,
                       },
                     };
+                    markProgress();
                   }
 
                   // Yield tool call completed
@@ -2357,6 +2374,7 @@ export class AgentServiceClient {
                         arguments: parsed.toolCallCompleted.arguments,
                       },
                     };
+                    markProgress();
                   }
 
                   // Yield partial tool call updates
@@ -2372,6 +2390,7 @@ export class AgentServiceClient {
                       },
                       partialArgs: parsed.partialToolCall.argsTextDelta,
                     };
+                    markProgress();
                   }
 
                   if (parsed.isComplete) {
@@ -2380,7 +2399,18 @@ export class AgentServiceClient {
 
                   // Yield heartbeat events for the server to track
                   if (parsed.isHeartbeat) {
-                    yield { type: "heartbeat" };
+                    heartbeatSinceProgress++;
+                    const idleMs = Date.now() - lastProgressAt;
+                    const idleLimit = hasProgress ? HEARTBEAT_IDLE_MS_PROGRESS : HEARTBEAT_IDLE_MS_NOPROGRESS;
+                    const beatLimit = hasProgress ? HEARTBEAT_MAX_PROGRESS : HEARTBEAT_MAX_NOPROGRESS;
+                    if (heartbeatSinceProgress >= beatLimit || idleMs >= idleLimit) {
+                      console.warn(
+                        `[DEBUG] Heartbeat idle for ${idleMs}ms (${heartbeatSinceProgress} beats) - closing stream`
+                      );
+                      turnEnded = true;
+                    } else {
+                      yield { type: "heartbeat" };
+                    }
                   }
                 }
 
@@ -2403,6 +2433,7 @@ export class AgentServiceClient {
                     }
                   }
                   yield { type: "checkpoint" };
+                  markProgress();
                   // DO NOT set turnEnded here - exec messages may follow!
                 }
 
@@ -2433,6 +2464,7 @@ export class AgentServiceClient {
                       type: "exec_request",
                       execRequest,
                     };
+                    markProgress();
                   } else {
                     // Log other exec types we don't handle yet
                     const execFields = parseProtoFields(field.value);
@@ -2447,10 +2479,81 @@ export class AgentServiceClient {
                   appendSeqno = await this.handleKvMessage(kvMsg, requestId, appendSeqno);
                   this.currentAppendSeqno = appendSeqno;
                 }
+
+                // field 5 = exec_server_control_message (abort signal from server)
+                if (field.fieldNumber === 5 && field.wireType === 2 && field.value instanceof Uint8Array) {
+                  console.log("[DEBUG] Received exec_server_control_message (field 5)!");
+                  const controlFields = parseProtoFields(field.value);
+                  console.log("[DEBUG] exec_server_control_message fields:", controlFields.map(f => `field${f.fieldNumber}:${f.wireType}`).join(", "));
+                  
+                  // ExecServerControlMessage has field 1 = abort (ExecServerAbort)
+                  for (const cf of controlFields) {
+                    if (cf.fieldNumber === 1 && cf.wireType === 2 && cf.value instanceof Uint8Array) {
+                      console.log("[DEBUG] Server sent abort signal!");
+                      // Parse ExecServerAbort - it has field 1 = id (string)
+                      const abortFields = parseProtoFields(cf.value);
+                      for (const af of abortFields) {
+                        if (af.fieldNumber === 1 && af.wireType === 2 && af.value instanceof Uint8Array) {
+                          const abortId = new TextDecoder().decode(af.value);
+                          console.log("[DEBUG] Abort id:", abortId);
+                        }
+                      }
+                      yield { type: "exec_server_abort" };
+                    }
+                  }
+                  markProgress();
+                }
+
+                // field 7 = interaction_query (server asking for user approval/input)
+                if (field.fieldNumber === 7 && field.wireType === 2 && field.value instanceof Uint8Array) {
+                  console.log("[DEBUG] Received interaction_query (field 7)!");
+                  const queryFields = parseProtoFields(field.value);
+                  console.log("[DEBUG] interaction_query fields:", queryFields.map(f => `field${f.fieldNumber}:${f.wireType}`).join(", "));
+                  
+                  // InteractionQuery structure:
+                  // field 1 = id (uint32)
+                  // field 2 = web_search_request_query (oneof)
+                  // field 3 = ask_question_interaction_query (oneof)
+                  // field 4 = switch_mode_request_query (oneof)
+                  // field 5 = exa_search_request_query (oneof)
+                  // field 6 = exa_fetch_request_query (oneof)
+                  let queryId = 0;
+                  let queryType = 'unknown';
+                  
+                  for (const qf of queryFields) {
+                    if (qf.fieldNumber === 1 && qf.wireType === 0) {
+                      queryId = Number(qf.value);
+                    } else if (qf.fieldNumber === 2 && qf.wireType === 2) {
+                      queryType = 'web_search';
+                    } else if (qf.fieldNumber === 3 && qf.wireType === 2) {
+                      queryType = 'ask_question';
+                    } else if (qf.fieldNumber === 4 && qf.wireType === 2) {
+                      queryType = 'switch_mode';
+                    } else if (qf.fieldNumber === 5 && qf.wireType === 2) {
+                      queryType = 'exa_search';
+                    } else if (qf.fieldNumber === 6 && qf.wireType === 2) {
+                      queryType = 'exa_fetch';
+                    }
+                  }
+                  
+                  console.log(`[DEBUG] InteractionQuery: id=${queryId}, type=${queryType}`);
+                  
+                  // Yield the interaction query for the server to handle
+                  yield {
+                    type: "interaction_query",
+                    queryId,
+                    queryType,
+                  };
+                  markProgress();
+                }
               } catch (parseErr: any) {
                 console.error("Error parsing field:", field.fieldNumber, parseErr);
                 yield { type: "error", error: `Parse error in field ${field.fieldNumber}: ${parseErr.message}` };
               }
+            }
+
+            if (turnEnded) {
+              break;
             }
           }
 

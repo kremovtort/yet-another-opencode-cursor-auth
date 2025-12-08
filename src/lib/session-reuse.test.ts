@@ -84,7 +84,7 @@ describe("tool result forwarding", () => {
     let called = false;
 
     const session: SessionLike = {
-      id: "sess_demo",
+      id: "demo",
       iterator: makeIterator(() => {}),
       pendingExecs: new Map([[toolCallId, execReq]]),
       createdAt: now,
@@ -126,6 +126,88 @@ describe("tool result forwarding", () => {
     expect(session.pendingExecs.size).toBe(0);
     expect(session.state).toBe("running");
   });
+
+  test("sendToolResultsToCursor ignores tool messages that do not match pending execs", async () => {
+    const now = Date.now();
+    const toolCallId = "sess_demo__call_1";
+    const execReq: ExecRequest = { type: "shell", id: 7, command: "echo hi" } as any;
+    const session: SessionLike = {
+      id: "demo",
+      iterator: makeIterator(() => {}),
+      pendingExecs: new Map([[toolCallId, execReq]]),
+      createdAt: now,
+      lastActivity: now,
+      state: "waiting_tool",
+      client: {
+        async sendToolResult() { throw new Error("unexpected"); },
+        async sendShellResult() { throw new Error("unexpected"); },
+        async sendReadResult() { throw new Error("unexpected"); },
+        async sendLsResult() { throw new Error("unexpected"); },
+        async sendGrepResult() { throw new Error("unexpected"); },
+      },
+    };
+
+    const toolMessages = [
+      { role: "tool" as const, tool_call_id: "sess_other__call_1", content: "x" },
+    ];
+
+    const ok = await sendToolResultsToCursor(session, toolMessages);
+    expect(ok).toBe(false);
+    expect(session.pendingExecs.size).toBe(1);
+    expect(session.state).toBe("waiting_tool");
+    expect(session.lastActivity).toBe(now);
+  });
+
+  test("sendToolResultsToCursor processes matching tool messages even when unknown are present", async () => {
+    const now = Date.now();
+    const toolCallId = "sess_demo__call_1";
+    const execReq: ExecRequest = { type: "shell", id: 7, command: "echo hi" } as any;
+    let called = false;
+
+    const session: SessionLike = {
+      id: "demo",
+      iterator: makeIterator(() => {}),
+      pendingExecs: new Map([[toolCallId, execReq]]),
+      createdAt: now,
+      lastActivity: now,
+      state: "waiting_tool",
+      client: {
+        async sendToolResult() {
+          throw new Error("unexpected");
+        },
+        async sendShellResult(_id, _execId, _cmd, _cwd, stdout) {
+          expect(stdout).toBe("ok");
+          called = true;
+        },
+        async sendReadResult() {
+          throw new Error("unexpected");
+        },
+        async sendLsResult() {
+          throw new Error("unexpected");
+        },
+        async sendGrepResult() {
+          throw new Error("unexpected");
+        },
+      },
+    };
+
+    const toolMessages = [
+      { role: "tool" as const, tool_call_id: "sess_other__call_1", content: "ignored" },
+      {
+        role: "tool" as const,
+        tool_call_id: toolCallId,
+        content: JSON.stringify({ stdout: "ok" }),
+      },
+    ];
+
+    const ok = await sendToolResultsToCursor(session, toolMessages);
+    expect(ok).toBe(true);
+    expect(called).toBe(true);
+    expect(session.pendingExecs.size).toBe(0);
+    expect(session.state).toBe("running");
+    expect(session.lastActivity).toBeGreaterThanOrEqual(now);
+  });
+
 });
 
 describe("cleanupExpiredSessions", () => {

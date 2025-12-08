@@ -167,12 +167,17 @@ export async function sendToolResultsToCursor(
   session: SessionLike,
   toolMessages: OpenAIMessageLite[]
 ): Promise<boolean> {
+  let processedAny = false;
+
   for (const message of toolMessages) {
     if (!message.tool_call_id) continue;
+
     const execReq = session.pendingExecs.get(message.tool_call_id);
     if (!execReq) {
-      console.warn(`[Session ${session.id}] Missing exec request for tool_call_id ${message.tool_call_id}`);
-      return false;
+      console.warn(
+        `[Session ${session.id}] Tool result for unknown tool_call_id ${message.tool_call_id}; ignoring`
+      );
+      continue;
     }
 
     const content = extractMessageContent(message);
@@ -224,11 +229,15 @@ export async function sendToolResultsToCursor(
     }
 
     session.pendingExecs.delete(message.tool_call_id);
+    processedAny = true;
   }
 
-  session.state = "running";
-  session.lastActivity = Date.now();
-  return true;
+  if (processedAny) {
+    session.state = "running";
+    session.lastActivity = Date.now();
+  }
+
+  return processedAny;
 }
 
 export async function cleanupExpiredSessions(
