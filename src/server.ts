@@ -956,10 +956,11 @@ async function legacyStreamResponse({ body, model, prompt, completionId, created
               console.log(`[DEBUG] MCP Tool call started: ${chunk.toolCall.name}`);
             } else {
               console.log(`[DEBUG] Built-in tool call started (handling via exec_request): ${chunk.toolCall.name}`);
-              // Track edit tool calls - they require an internal read first which we should skip
-              if (chunk.toolCall.name === "edit") {
+              // Track file-modifying tool calls - they may require an internal read first which we should handle locally
+              // This includes: edit, apply_diff, and potentially others
+              if (chunk.toolCall.name === "edit" || chunk.toolCall.name === "apply_diff") {
                 pendingEditToolCall = chunk.toolCall.callId;
-                console.log(`[DEBUG] Edit tool started, will skip internal read. callId: ${pendingEditToolCall}`);
+                console.log(`[DEBUG] File-modifying tool started (${chunk.toolCall.name}), will handle internal read locally. callId: ${pendingEditToolCall}`);
               }
             }
             toolCallIdMap.set(chunk.toolCall.callId, toolCallIndex++);

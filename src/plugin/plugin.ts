@@ -361,6 +361,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     const encoder = new TextEncoder();
     let isClosed = false;
     let mcpToolCallIndex = 0;
+    let pendingEditToolCall: string | null = null; // Track if we're in an edit/apply_diff flow
 
     const readable = new ReadableStream({
       async start(controller) {
@@ -388,11 +389,34 @@ async function handleChatCompletions(req: Request): Promise<Response> {
                   choices: [{ index: 0, delta: { content: chunk.content }, finish_reason: null }],
                 })));
               }
+            } else if (chunk.type === "tool_call_started" && chunk.toolCall) {
+              // Track file-modifying tool calls - they may require an internal read first
+              if (chunk.toolCall.name === "edit" || chunk.toolCall.name === "apply_diff") {
+                pendingEditToolCall = chunk.toolCall.callId;
+                console.log(`[Cursor Proxy] File-modifying tool started (${chunk.toolCall.name}), will handle internal read locally`);
+              }
             } else if (chunk.type === "exec_request" && chunk.execRequest) {
               const execReq = chunk.execRequest;
               
               // Skip context requests - these are internal to Cursor
               if (execReq.type === "request_context") {
+                continue;
+              }
+              
+              // Skip reads that are part of an edit/apply_diff flow - Cursor internally reads before editing
+              // We handle these locally and let the actual write come through
+              if (execReq.type === "read" && pendingEditToolCall) {
+                console.log(`[Cursor Proxy] Handling internal read for edit flow locally`);
+                try {
+                  const file = Bun.file(execReq.path);
+                  const content = await file.text();
+                  const stats = await file.stat();
+                  const totalLines = content.split("\n").length;
+                  await client.sendReadResult(execReq.id, execReq.execId, content, execReq.path, totalLines, BigInt(stats.size), false);
+                  console.log(`[Cursor Proxy] Internal read completed for edit flow`);
+                } catch (err: any) {
+                  await client.sendReadResult(execReq.id, execReq.execId, `Error: ${err.message}`, execReq.path, 0, 0n, false);
+                }
                 continue;
               }
               
