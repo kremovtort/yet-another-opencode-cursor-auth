@@ -427,40 +427,33 @@ function messagesToPrompt(messages: OpenAIMessage[]): string {
   // Check if this is a continuation with tool results
   const hasToolResults = conversationMessages.some(m => m.role === "tool");
   
-  if (hasToolResults) {
-    // Multi-turn with tool results - format the full conversation
-    for (const msg of conversationMessages) {
-      if (msg.role === "user") {
-        parts.push(`User: ${msg.content ?? ""}`);
-      } else if (msg.role === "assistant") {
-        if (msg.tool_calls && msg.tool_calls.length > 0) {
-          // Assistant made tool calls - show what was called
-          const toolCallsDesc = msg.tool_calls.map(tc => 
-            `[Called tool: ${tc.function.name}(${tc.function.arguments})]`
-          ).join("\n");
-          if (msg.content) {
-            parts.push(`Assistant: ${msg.content}\n${toolCallsDesc}`);
-          } else {
-            parts.push(`Assistant: ${toolCallsDesc}`);
-          }
-        } else if (msg.content) {
-          parts.push(`Assistant: ${msg.content}`);
+  // Format the full conversation history
+  for (const msg of conversationMessages) {
+    if (msg.role === "user") {
+      parts.push(`User: ${msg.content ?? ""}`);
+    } else if (msg.role === "assistant") {
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        // Assistant made tool calls - show what was called
+        const toolCallsDesc = msg.tool_calls.map(tc => 
+          `[Called tool: ${tc.function.name}(${tc.function.arguments})]`
+        ).join("\n");
+        if (msg.content) {
+          parts.push(`Assistant: ${msg.content}\n${toolCallsDesc}`);
+        } else {
+          parts.push(`Assistant: ${toolCallsDesc}`);
         }
-      } else if (msg.role === "tool") {
-        // Tool result - show the result with the tool call ID for context
-        parts.push(`[Tool result for ${msg.tool_call_id}]: ${msg.content ?? ""}`);
+      } else if (msg.content) {
+        parts.push(`Assistant: ${msg.content}`);
       }
+    } else if (msg.role === "tool") {
+      // Tool result - show the result with the tool call ID for context
+      parts.push(`[Tool result for ${msg.tool_call_id}]: ${msg.content ?? ""}`);
     }
-    
-    // Add instruction for the model to continue
+  }
+  
+  // Add instruction for the model to continue if there are tool results
+  if (hasToolResults) {
     parts.push("\nBased on the tool results above, please continue your response:");
-  } else {
-    // Simple case - just use the last user message (original behavior)
-    const userMessages = conversationMessages.filter(m => m.role === "user");
-    if (userMessages.length > 0) {
-      const lastUserMsg = userMessages[userMessages.length - 1];
-      parts.push(lastUserMsg?.content ?? "");
-    }
   }
   
   return parts.join("\n\n");
