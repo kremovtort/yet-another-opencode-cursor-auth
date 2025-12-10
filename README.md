@@ -109,14 +109,104 @@ for await (const chunk of response) {
 
 ### With OpenCode
 
-Add to your OpenCode configuration:
+Add to your `opencode.json` configuration:
 
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "name": "cursor-proxy",
-    "baseURL": "http://localhost:18741/v1",
-    "apiKey": "not-needed"
+    "cursor": {
+      "name": "Cursor",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:18741/v1",
+        "apiKey": "cursor-via-opencode"
+      },
+      "models": {
+        "auto": {
+          "name": "Auto",
+          "temperature": true,
+          "attachment": true
+        },
+        "claude-4.5-sonnet": {
+          "name": "Claude 4.5 Sonnet",
+          "temperature": true,
+          "attachment": true
+        },
+        "claude-4.5-sonnet-thinking": {
+          "name": "Claude 4.5 Sonnet (Thinking)",
+          "temperature": true,
+          "attachment": true,
+          "reasoning": true
+        },
+        "claude-4.5-opus-high": {
+          "name": "Claude 4.5 Opus",
+          "temperature": true,
+          "attachment": true
+        },
+        "claude-4.5-opus-high-thinking": {
+          "name": "Claude 4.5 Opus (Thinking)",
+          "temperature": true,
+          "attachment": true,
+          "reasoning": true
+        },
+        "claude-4-opus": {
+          "name": "Claude 4.1 Opus",
+          "temperature": true,
+          "attachment": true
+        },
+        "gpt-4o": {
+          "name": "GPT-4o",
+          "temperature": true,
+          "attachment": true
+        },
+        "gpt-5.1": {
+          "name": "GPT-5.1",
+          "temperature": true,
+          "attachment": true
+        },
+        "gpt-5.1-high": {
+          "name": "GPT-5.1 High",
+          "temperature": true,
+          "attachment": true
+        },
+        "gpt-5.1-codex": {
+          "name": "GPT-5.1 Codex",
+          "temperature": true,
+          "attachment": true
+        },
+        "gpt-5.1-codex-high": {
+          "name": "GPT-5.1 Codex High",
+          "temperature": true,
+          "attachment": true
+        },
+        "gpt-5.1-codex-max": {
+          "name": "GPT-5.1 Codex Max",
+          "temperature": true,
+          "attachment": true
+        },
+        "gpt-5.1-codex-max-high": {
+          "name": "GPT-5.1 Codex Max High",
+          "temperature": true,
+          "attachment": true
+        },
+        "gemini-3-pro": {
+          "name": "Gemini 3 Pro",
+          "temperature": true,
+          "attachment": true
+        },
+        "grok-code-fast-1": {
+          "name": "Grok",
+          "temperature": true,
+          "attachment": true
+        },
+        "composer-1": {
+          "name": "Composer 1",
+          "temperature": true,
+          "attachment": true
+        }
+      }
+    }
   }
 }
 ```
