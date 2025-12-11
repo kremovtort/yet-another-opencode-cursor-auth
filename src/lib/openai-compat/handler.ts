@@ -34,6 +34,58 @@ import {
   createStreamChunk,
   generateToolCallId,
 } from "./utils";
+import type { CursorModelInfo } from "../api/cursor-models";
+
+// --- Model Cache ---
+interface ModelCache {
+  models: CursorModelInfo[] | null;
+  time: number;
+}
+const modelCache: ModelCache = { models: null, time: 0 };
+const MODEL_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Get cached models or fetch fresh ones
+ */
+async function getCachedModels(accessToken: string): Promise<CursorModelInfo[]> {
+  const now = Date.now();
+  if (modelCache.models && now - modelCache.time < MODEL_CACHE_TTL) {
+    return modelCache.models;
+  }
+
+  const cursorClient = new CursorClient(accessToken);
+  const models = await listCursorModels(cursorClient);
+  modelCache.models = models;
+  modelCache.time = now;
+  return models;
+}
+
+/**
+ * Resolve a requested model name to its internal model ID
+ * Maps displayModelId/aliases to the actual modelId used by the agent service
+ */
+function resolveModel(requestedModel: string, models: CursorModelInfo[]): string {
+  // Direct match on modelId
+  const directMatch = models.find(m => m.modelId === requestedModel);
+  if (directMatch) {
+    return directMatch.modelId;
+  }
+
+  // Match on displayModelId
+  const displayMatch = models.find(m => m.displayModelId === requestedModel);
+  if (displayMatch) {
+    return displayMatch.modelId;
+  }
+
+  // Match on aliases
+  const aliasMatch = models.find(m => m.aliases.includes(requestedModel));
+  if (aliasMatch) {
+    return aliasMatch.modelId;
+  }
+
+  // No match found, return as-is (let Cursor API handle it)
+  return requestedModel;
+}
 
 /**
  * Options for the request handler
@@ -118,7 +170,17 @@ async function handleChatCompletions(
     return createErrorResponse("messages is required and must be a non-empty array");
   }
 
-  const model = body.model ?? "auto";
+  // Resolve model name to internal model ID
+  let model: string;
+  try {
+    const models = await getCachedModels(accessToken);
+    model = resolveModel(body.model ?? "auto", models);
+    log(`[OpenAI Compat] Resolved model "${body.model ?? "auto"}" to "${model}"`);
+  } catch (err) {
+    log("[OpenAI Compat] Failed to fetch models, using requested model directly:", err);
+    model = body.model ?? "default";
+  }
+
   const prompt = messagesToPrompt(body.messages);
   const stream = body.stream ?? false;
   const tools = body.tools as OpenAIToolDefinition[] | undefined;
