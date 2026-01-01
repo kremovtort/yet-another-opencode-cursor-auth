@@ -33,6 +33,61 @@
 
 import { randomUUID } from "node:crypto";
 import { generateChecksum, addConnectEnvelope } from "./cursor-client";
+import {
+  encodeVarint,
+  encodeStringField,
+  encodeUint32Field,
+  encodeInt32Field,
+  encodeInt64Field,
+  encodeMessageField,
+  encodeBoolField,
+  encodeDoubleField,
+  concatBytes,
+  encodeProtobufValue,
+  parseProtoFields,
+  parseExecServerMessage,
+  buildExecClientMessageWithMcpResult,
+  buildExecClientMessageWithShellResult,
+  buildExecClientMessageWithLsResult,
+  buildExecClientMessageWithRequestContextResult,
+  buildExecClientMessageWithReadResult,
+  buildExecClientMessageWithGrepResult,
+  buildExecClientMessageWithWriteResult,
+  buildAgentClientMessageWithExec,
+  buildExecClientControlMessage,
+  buildAgentClientMessageWithExecControl,
+  parseToolCall,
+  parseToolCallStartedUpdate,
+  parsePartialToolCallUpdate,
+  parseKvServerMessage,
+  buildKvClientMessage,
+  buildAgentClientMessageWithKv,
+  AgentMode,
+} from "./proto";
+import type {
+  OpenAIToolDefinition,
+  McpExecRequest,
+  ShellExecRequest,
+  LsExecRequest,
+  ReadExecRequest,
+  GrepExecRequest,
+  WriteExecRequest,
+  ExecRequest,
+  KvServerMessage,
+  ChatTimingMetrics,
+  AgentServiceOptions,
+  AgentChatRequest,
+  McpResult,
+  WriteResult,
+  ParsedToolCall,
+  ToolCallInfo,
+  AgentStreamChunk as AgentStreamChunkType,
+} from "./proto/types";
+
+// Re-export types that external code may need
+export { AgentMode };
+export type AgentStreamChunk = AgentStreamChunkType;
+export type { ExecRequest, McpExecRequest, ToolCallInfo, OpenAIToolDefinition };
 
 // Debug logging - set to true to enable verbose logging
 const DEBUG = process.env.CURSOR_DEBUG === "1";
@@ -42,30 +97,7 @@ const debugLog = DEBUG ? console.log.bind(console) : () => {};
 const TIMING_ENABLED = process.env.CURSOR_TIMING === "1" || DEBUG;
 const timingLog = TIMING_ENABLED ? console.log.bind(console) : () => {};
 
-/**
- * Performance metrics for a single chat request
- */
-export interface ChatTimingMetrics {
-  requestStart: number;
-  messageBuildMs?: number;
-  sseConnectionMs?: number;
-  firstBidiAppendMs?: number;
-  firstChunkMs?: number;
-  firstTextMs?: number;
-  firstToolCallMs?: number;
-  turnEndedMs?: number;
-  totalMs?: number;
-  chunkCount: number;
-  textChunks: number;
-  toolCalls: number;
-  execRequests: number;
-  kvMessages: number;
-  heartbeats: number;
-}
 
-/**
- * Create empty timing metrics
- */
 function createTimingMetrics(): ChatTimingMetrics {
   return {
     requestStart: Date.now(),
@@ -85,18 +117,18 @@ function logTimingMetrics(metrics: ChatTimingMetrics): void {
   timingLog("[TIMING] ═══════════════════════════════════════════════════════");
   timingLog("[TIMING] Request Performance Summary");
   timingLog("[TIMING] ───────────────────────────────────────────────────────");
-  timingLog("[TIMING]   Message build:     " + (metrics.messageBuildMs ?? "-") + "ms");
-  timingLog("[TIMING]   SSE connection:    " + (metrics.sseConnectionMs ?? "-") + "ms");
-  timingLog("[TIMING]   First BidiAppend:  " + (metrics.firstBidiAppendMs ?? "-") + "ms");
-  timingLog("[TIMING]   First chunk:       " + (metrics.firstChunkMs ?? "-") + "ms");
-  timingLog("[TIMING]   First text:        " + (metrics.firstTextMs ?? "-") + "ms");
-  timingLog("[TIMING]   First tool call:   " + (metrics.firstToolCallMs ?? "-") + "ms");
-  timingLog("[TIMING]   Turn ended:        " + (metrics.turnEndedMs ?? "-") + "ms");
-  timingLog("[TIMING]   Total:             " + total + "ms");
+  timingLog(`[TIMING]   Message build:     ${metrics.messageBuildMs ?? "-"}ms`);
+  timingLog(`[TIMING]   SSE connection:    ${metrics.sseConnectionMs ?? "-"}ms`);
+  timingLog(`[TIMING]   First BidiAppend:  ${metrics.firstBidiAppendMs ?? "-"}ms`);
+  timingLog(`[TIMING]   First chunk:       ${metrics.firstChunkMs ?? "-"}ms`);
+  timingLog(`[TIMING]   First text:        ${metrics.firstTextMs ?? "-"}ms`);
+  timingLog(`[TIMING]   First tool call:   ${metrics.firstToolCallMs ?? "-"}ms`);
+  timingLog(`[TIMING]   Turn ended:        ${metrics.turnEndedMs ?? "-"}ms`);
+  timingLog(`[TIMING]   Total:             ${total}ms`);
   timingLog("[TIMING] ───────────────────────────────────────────────────────");
-  timingLog("[TIMING]   Chunks: " + metrics.chunkCount + " (text: " + metrics.textChunks + ", tools: " + metrics.toolCalls + ")");
-  timingLog("[TIMING]   Exec requests: " + metrics.execRequests + ", KV messages: " + metrics.kvMessages);
-  timingLog("[TIMING]   Heartbeats: " + metrics.heartbeats);
+  timingLog(`[TIMING]   Chunks: ${metrics.chunkCount} (text: ${metrics.textChunks}, tools: ${metrics.toolCalls})`);
+  timingLog(`[TIMING]   Exec requests: ${metrics.execRequests}, KV messages: ${metrics.kvMessages}`);
+  timingLog(`[TIMING]   Heartbeats: ${metrics.heartbeats}`);
   timingLog("[TIMING] ═══════════════════════════════════════════════════════");
 }
 
@@ -107,191 +139,7 @@ export const CURSOR_API_URL = "https://api2.cursor.sh";
 export const AGENT_PRIVACY_URL = "https://agent.api5.cursor.sh";
 export const AGENT_NON_PRIVACY_URL = "https://agentn.api5.cursor.sh";
 
-// Agent modes
-export enum AgentMode {
-  UNSPECIFIED = 0,
-  AGENT = 1,
-  ASK = 2,
-  PLAN = 3,
-  DEBUG = 4,
-  TRIAGE = 5,
-}
-
-// --- Protobuf Encoding Helpers ---
-
-function encodeVarint(value: number | bigint): Uint8Array {
-  const bytes: number[] = [];
-  let v = BigInt(value);
-  while (v > 127n) {
-    bytes.push(Number(v & 0x7fn) | 0x80);
-    v >>= 7n;
-  }
-  bytes.push(Number(v));
-  return new Uint8Array(bytes);
-}
-
-function encodeStringField(fieldNumber: number, value: string): Uint8Array {
-  if (!value) return new Uint8Array(0);
-
-  const fieldTag = (fieldNumber << 3) | 2; // wire type 2 = length-delimited
-  const encoded = new TextEncoder().encode(value);
-  const length = encodeVarint(encoded.length);
-
-  const result = new Uint8Array(1 + length.length + encoded.length);
-  result[0] = fieldTag;
-  result.set(length, 1);
-  result.set(encoded, 1 + length.length);
-
-  return result;
-}
-
-function encodeUint32Field(fieldNumber: number, value: number): Uint8Array {
-  if (value === 0) return new Uint8Array(0);
-
-  const fieldTag = (fieldNumber << 3) | 0; // wire type 0 = varint
-  const encoded = encodeVarint(value);
-
-  const result = new Uint8Array(1 + encoded.length);
-  result[0] = fieldTag;
-  result.set(encoded, 1);
-
-  return result;
-}
-
-function encodeInt32Field(fieldNumber: number, value: number): Uint8Array {
-  if (value === 0) return new Uint8Array(0);
-
-  const fieldTag = (fieldNumber << 3) | 0; // wire type 0 = varint
-  const encoded = encodeVarint(value);
-
-  const result = new Uint8Array(1 + encoded.length);
-  result[0] = fieldTag;
-  result.set(encoded, 1);
-
-  return result;
-}
-
-function encodeInt64Field(fieldNumber: number, value: bigint): Uint8Array {
-  const fieldTag = (fieldNumber << 3) | 0; // wire type 0 = varint
-  const encoded = encodeVarint(value);
-
-  const result = new Uint8Array(1 + encoded.length);
-  result[0] = fieldTag;
-  result.set(encoded, 1);
-
-  return result;
-}
-
-function encodeMessageField(fieldNumber: number, data: Uint8Array): Uint8Array {
-  const fieldTag = (fieldNumber << 3) | 2; // wire type 2 = length-delimited
-  const length = encodeVarint(data.length);
-
-  const result = new Uint8Array(1 + length.length + data.length);
-  result[0] = fieldTag;
-  result.set(length, 1);
-  result.set(data, 1 + length.length);
-
-  return result;
-}
-
-function concatBytes(...arrays: Uint8Array[]): Uint8Array {
-  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const arr of arrays) {
-    result.set(arr, offset);
-    offset += arr.length;
-  }
-  return result;
-}
-
-function encodeBoolField(fieldNumber: number, value: boolean): Uint8Array {
-  const fieldTag = (fieldNumber << 3) | 0; // wire type 0 = varint
-  return new Uint8Array([fieldTag, value ? 1 : 0]);
-}
-
-function encodeDoubleField(fieldNumber: number, value: number): Uint8Array {
-  const fieldTag = (fieldNumber << 3) | 1; // wire type 1 = 64-bit
-  const buffer = new ArrayBuffer(9);
-  const view = new DataView(buffer);
-  view.setUint8(0, fieldTag);
-  view.setFloat64(1, value, true); // little-endian
-  return new Uint8Array(buffer);
-}
-
-// --- google.protobuf.Value Encoding ---
-
-/**
- * Encode a JavaScript value as google.protobuf.Value
- *
- * google.protobuf.Value oneof:
- *   field 1: null_value (enum NullValue)
- *   field 2: number_value (double)
- *   field 3: string_value (string)
- *   field 4: bool_value (bool)
- *   field 5: struct_value (Struct)
- *   field 6: list_value (ListValue)
- */
-function encodeProtobufValue(value: any): Uint8Array {
-  if (value === null || value === undefined) {
-    // NullValue enum = 0
-    return encodeUint32Field(1, 0);
-  }
-
-  if (typeof value === "number") {
-    return encodeDoubleField(2, value);
-  }
-
-  if (typeof value === "string") {
-    return encodeStringField(3, value);
-  }
-
-  if (typeof value === "boolean") {
-    return encodeBoolField(4, value);
-  }
-
-  if (Array.isArray(value)) {
-    // ListValue: field 1 = repeated Value
-    const listBytes: Uint8Array[] = [];
-    for (const item of value) {
-      const itemValue = encodeProtobufValue(item);
-      listBytes.push(encodeMessageField(1, itemValue));
-    }
-    const listValue = concatBytes(...listBytes);
-    return encodeMessageField(6, listValue);
-  }
-
-  if (typeof value === "object") {
-    // Struct: field 1 = map<string, Value> (encoded as repeated MapEntry)
-    // MapEntry: field 1 = key (string), field 2 = value (Value)
-    const structBytes: Uint8Array[] = [];
-    for (const [key, val] of Object.entries(value)) {
-      const keyBytes = encodeStringField(1, key);
-      const valBytes = encodeMessageField(2, encodeProtobufValue(val));
-      const mapEntry = concatBytes(keyBytes, valBytes);
-      structBytes.push(encodeMessageField(1, mapEntry));
-    }
-    const structValue = concatBytes(...structBytes);
-    return encodeMessageField(5, structValue);
-  }
-
-  // Fallback: encode as string
-  return encodeStringField(3, String(value));
-}
-
 // --- MCP Tool Definition Encoding ---
-
-/**
- * Tool definition in OpenAI format
- */
-export interface OpenAIToolDefinition {
-  type: "function";
-  function: {
-    name: string;
-    description?: string;
-    parameters?: Record<string, any>;
-  };
-}
 
 /**
  * Encode McpToolDefinition message
@@ -303,7 +151,7 @@ export interface OpenAIToolDefinition {
  *   field 4: provider_identifier (string)
  *   field 5: tool_name (string)
  */
-function encodeMcpToolDefinition(tool: OpenAIToolDefinition, providerIdentifier: string = "cursor-tools"): Uint8Array {
+function encodeMcpToolDefinition(tool: OpenAIToolDefinition, providerIdentifier = "cursor-tools"): Uint8Array {
   const toolName = tool.function.name;
   // The name field should be the combined identifier (provider-toolname) with hyphen
   // This matches how Cursor's McpManager creates tool names: `${tool.clientName}-${tool.name}`
@@ -366,7 +214,7 @@ function encodeBidiAppendRequest(data: string, requestId: string, appendSeqno: b
  */
 function buildRequestContextEnv(workspacePath: string = process.cwd()): Uint8Array {
   return concatBytes(
-    encodeStringField(1, `darwin 24.0.0`),
+    encodeStringField(1, "darwin 24.0.0"),
     encodeStringField(2, workspacePath),
     encodeStringField(3, '/bin/zsh'),
     encodeStringField(10, Intl.DateTimeFormat().resolvedOptions().timeZone),
@@ -637,1377 +485,17 @@ function encodeAgentClientMessage(runRequest: Uint8Array): Uint8Array {
   return encodeMessageField(1, runRequest);
 }
 
-/**
- * Build KvClientMessage
- * KvClientMessage:
- *   field 1: id (uint32)
- *   field 2: get_blob_result (GetBlobResult)
- *   field 3: set_blob_result (SetBlobResult)
- */
-function buildKvClientMessage(id: number, resultType: 'get_blob_result' | 'set_blob_result', result: Uint8Array): Uint8Array {
-  const fieldNumber = resultType === 'get_blob_result' ? 2 : 3;
-  return concatBytes(
-    encodeUint32Field(1, id),
-    encodeMessageField(fieldNumber, result)
-  );
-}
-
-/**
- * Build AgentClientMessage with kv_client_message
- * AgentClientMessage:
- *   field 3: kv_client_message (KvClientMessage)
- */
-function buildAgentClientMessageWithKv(kvClientMessage: Uint8Array): Uint8Array {
-  return encodeMessageField(3, kvClientMessage);
-}
-
-// --- Response Parsing ---
-
-interface ParsedField {
-  fieldNumber: number;
-  wireType: number;
-  value: Uint8Array | number | bigint;
-}
-
-function decodeVarint(data: Uint8Array, offset: number): { value: number; bytesRead: number } {
-  let value = 0;
-  let shift = 0;
-  let bytesRead = 0;
-
-  while (offset + bytesRead < data.length) {
-    const byte = data[offset + bytesRead];
-    if (byte === undefined) break;
-    value |= (byte & 0x7f) << shift;
-    bytesRead++;
-
-    if ((byte & 0x80) === 0) {
-      break;
-    }
-    shift += 7;
-  }
-
-  return { value, bytesRead };
-}
-
-function parseProtoFields(data: Uint8Array): ParsedField[] {
-  const fields: ParsedField[] = [];
-  let offset = 0;
-
-  while (offset < data.length) {
-    const tagInfo = decodeVarint(data, offset);
-    offset += tagInfo.bytesRead;
-
-    const fieldNumber = tagInfo.value >> 3;
-    const wireType = tagInfo.value & 0x7;
-
-    if (wireType === 2) { // length-delimited
-      const lengthInfo = decodeVarint(data, offset);
-      offset += lengthInfo.bytesRead;
-      const value = data.slice(offset, offset + lengthInfo.value);
-      offset += lengthInfo.value;
-      fields.push({ fieldNumber, wireType, value });
-    } else if (wireType === 0) { // varint
-      const valueInfo = decodeVarint(data, offset);
-      offset += valueInfo.bytesRead;
-      fields.push({ fieldNumber, wireType, value: valueInfo.value });
-    } else if (wireType === 1) { // 64-bit
-      const value = data.slice(offset, offset + 8);
-      offset += 8;
-      fields.push({ fieldNumber, wireType, value });
-    } else if (wireType === 5) { // 32-bit
-      const value = data.slice(offset, offset + 4);
-      offset += 4;
-      fields.push({ fieldNumber, wireType, value });
-    } else {
-      break;
-    }
-  }
-
-  return fields;
-}
-
-// --- KV Message Parsing ---
-
-interface KvServerMessage {
-  id: number;
-  messageType: 'get_blob_args' | 'set_blob_args' | 'unknown';
-  blobId?: Uint8Array;
-  blobData?: Uint8Array;
-}
-
-function parseKvServerMessage(data: Uint8Array): KvServerMessage {
-  const fields = parseProtoFields(data);
-  const result: KvServerMessage = { id: 0, messageType: 'unknown' };
-
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 0) {
-      result.id = field.value as number;
-    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      result.messageType = 'get_blob_args';
-      const argsFields = parseProtoFields(field.value);
-      for (const af of argsFields) {
-        if (af.fieldNumber === 1 && af.wireType === 2 && af.value instanceof Uint8Array) {
-          result.blobId = af.value;
-        }
-      }
-    } else if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      result.messageType = 'set_blob_args';
-      const argsFields = parseProtoFields(field.value);
-      for (const af of argsFields) {
-        if (af.fieldNumber === 1 && af.wireType === 2 && af.value instanceof Uint8Array) {
-          result.blobId = af.value;
-        } else if (af.fieldNumber === 2 && af.wireType === 2 && af.value instanceof Uint8Array) {
-          result.blobData = af.value;
-        }
-      }
-    }
-  }
-
-  return result;
-}
-
-// --- Exec Message Types ---
-
-/**
- * Parsed ExecServerMessage with mcp_args
- */
-export interface McpExecRequest {
-  id: number;           // Execution ID - must be returned in response
-  execId?: string;      // Optional exec ID
-  name: string;         // Combined name like "opencode___bash"
-  args: Record<string, any>;  // Tool arguments
-  toolCallId: string;   // Tool call ID
-  providerIdentifier: string; // e.g., "opencode"
-  toolName: string;     // e.g., "bash"
-}
-
-/**
- * Shell execution request (shell_args or shell_stream_args)
- */
-export interface ShellExecRequest {
-  type: 'shell';
-  id: number;
-  execId?: string;
-  command: string;
-  cwd?: string;
-}
-
-/**
- * LS (directory listing) request
- */
-export interface LsExecRequest {
-  type: 'ls';
-  id: number;
-  execId?: string;
-  path: string;
-}
-
-/**
- * Request context request
- */
-export interface RequestContextExecRequest {
-  type: 'request_context';
-  id: number;
-  execId?: string;
-}
-
-/**
- * Read file request
- */
-export interface ReadExecRequest {
-  type: 'read';
-  id: number;
-  execId?: string;
-  path: string;
-}
-
-/**
- * Grep/Glob execution request
- */
-export interface GrepExecRequest {
-  type: 'grep';
-  id: number;
-  execId?: string;
-  pattern: string;
-  path?: string;
-  glob?: string;
-}
-
-/**
- * Write file request
- * WriteArgs:
- *   field 1: path (string)
- *   field 2: file_text (string)
- *   field 3: tool_call_id (string)
- *   field 4: return_file_content_after_write (bool)
- *   field 5: file_bytes (bytes)
- */
-export interface WriteExecRequest {
-  type: 'write';
-  id: number;
-  execId?: string;
-  path: string;
-  fileText: string;
-  toolCallId?: string;
-  returnFileContentAfterWrite?: boolean;
-  fileBytes?: Uint8Array;
-}
-
-/**
- * Union type for all exec requests
- */
-export type ExecRequest =
-  | (McpExecRequest & { type: 'mcp' })
-  | ShellExecRequest
-  | LsExecRequest
-  | RequestContextExecRequest
-  | ReadExecRequest
-  | GrepExecRequest
-  | WriteExecRequest;
-
-/**
- * Parse google.protobuf.Value from protobuf bytes
- */
-function parseProtobufValue(data: Uint8Array): any {
-  const fields = parseProtoFields(data);
-
-  for (const field of fields) {
-    // null_value = field 1 (varint, NullValue enum)
-    if (field.fieldNumber === 1 && field.wireType === 0) {
-      return null;
-    }
-    // number_value = field 2 (double, wire type 1)
-    if (field.fieldNumber === 2 && field.wireType === 1 && field.value instanceof Uint8Array) {
-      const view = new DataView(field.value.buffer, field.value.byteOffset, 8);
-      return view.getFloat64(0, true);
-    }
-    // string_value = field 3 (string)
-    if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      return new TextDecoder().decode(field.value);
-    }
-    // bool_value = field 4 (bool)
-    if (field.fieldNumber === 4 && field.wireType === 0) {
-      return field.value === 1;
-    }
-    // struct_value = field 5 (Struct message)
-    if (field.fieldNumber === 5 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      return parseProtobufStruct(field.value);
-    }
-    // list_value = field 6 (ListValue message)
-    if (field.fieldNumber === 6 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      return parseProtobufListValue(field.value);
-    }
-  }
-
-  return undefined;
-}
-
-/**
- * Parse google.protobuf.Struct (map<string, Value>)
- */
-function parseProtobufStruct(data: Uint8Array): Record<string, any> {
-  const fields = parseProtoFields(data);
-  const result: Record<string, any> = {};
-
-  for (const field of fields) {
-    // field 1 = repeated MapEntry (fields: field 1 = key, field 2 = value)
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      const entryFields = parseProtoFields(field.value);
-      let key = "";
-      let value: any = undefined;
-
-      for (const ef of entryFields) {
-        if (ef.fieldNumber === 1 && ef.wireType === 2 && ef.value instanceof Uint8Array) {
-          key = new TextDecoder().decode(ef.value);
-        }
-        if (ef.fieldNumber === 2 && ef.wireType === 2 && ef.value instanceof Uint8Array) {
-          value = parseProtobufValue(ef.value);
-        }
-      }
-
-      if (key) {
-        result[key] = value;
-      }
-    }
-  }
-
-  return result;
-}
-
-/**
- * Parse google.protobuf.ListValue (repeated Value)
- */
-function parseProtobufListValue(data: Uint8Array): any[] {
-  const fields = parseProtoFields(data);
-  const result: any[] = [];
-
-  for (const field of fields) {
-    // field 1 = repeated Value
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      result.push(parseProtobufValue(field.value));
-    }
-  }
-
-  return result;
-}
-
-/**
- * Parse McpArgs from protobuf bytes
- * McpArgs:
- *   field 1: name (string)
- *   field 2: args (map<string, google.protobuf.Value>)
- *   field 3: tool_call_id (string)
- *   field 4: provider_identifier (string)
- *   field 5: tool_name (string)
- */
-function parseMcpArgs(data: Uint8Array): Omit<McpExecRequest, 'id' | 'execId'> {
-  const fields = parseProtoFields(data);
-  let name = "";
-  const args: Record<string, any> = {};
-  let toolCallId = "";
-  let providerIdentifier = "";
-  let toolName = "";
-
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      name = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      // Map entry: field 1 = key (string), field 2 = value (google.protobuf.Value)
-      const entryFields = parseProtoFields(field.value);
-      let key = "";
-      let value: any = undefined;
-
-      for (const ef of entryFields) {
-        if (ef.fieldNumber === 1 && ef.wireType === 2 && ef.value instanceof Uint8Array) {
-          key = new TextDecoder().decode(ef.value);
-        }
-        if (ef.fieldNumber === 2 && ef.wireType === 2 && ef.value instanceof Uint8Array) {
-          value = parseProtobufValue(ef.value);
-        }
-      }
-
-      if (key) {
-        args[key] = value;
-      }
-    } else if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      toolCallId = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 4 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      providerIdentifier = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 5 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      toolName = new TextDecoder().decode(field.value);
-    }
-  }
-
-  return { name, args, toolCallId, providerIdentifier, toolName };
-}
-
-/**
- * ExecServerMessage field mapping
- */
-const EXEC_MESSAGE_TYPES: Record<number, string> = {
-  2: "shell_args",
-  3: "write_args",
-  4: "delete_args",
-  5: "grep_args",
-  7: "read_args",
-  8: "ls_args",
-  9: "diagnostics_args",
-  10: "request_context_args",
-  11: "mcp_args",
-  14: "shell_stream_args",
-  16: "background_shell_spawn_args",
-  17: "list_mcp_resources_exec_args",
-  18: "read_mcp_resource_exec_args",
-  20: "fetch_args",
-  21: "record_screen_args",
-  22: "computer_use_args",
-};
-
-/**
- * Parse shell_args or shell_stream_args
- * ShellArgs:
- *   field 1: command (string)
- *   field 2: working_directory (string)
- */
-function parseShellArgs(data: Uint8Array): { command: string; cwd?: string } {
-  const fields = parseProtoFields(data);
-  let command = '';
-  let cwd: string | undefined;
-
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      command = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      cwd = new TextDecoder().decode(field.value);
-    }
-  }
-
-  return { command, cwd };
-}
-
-/**
- * Parse ls_args
- * LsArgs:
- *   field 1: path (string)
- */
-function parseLsArgs(data: Uint8Array): { path: string } {
-  const fields = parseProtoFields(data);
-  let path = process.cwd();
-
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      path = new TextDecoder().decode(field.value);
-    }
-  }
-
-  return { path };
-}
-
-/**
- * Parse read_args
- * ReadArgs:
- *   field 1: path (string)
- */
-function parseReadArgs(data: Uint8Array): { path: string } {
-  const fields = parseProtoFields(data);
-  let path = '';
-
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      path = new TextDecoder().decode(field.value);
-    }
-  }
-
-  return { path };
-}
-
-/**
- * Parse grep_args (also used for glob)
- * GrepArgs:
- *   field 1: pattern (string)
- *   field 2: path (string, optional)
- *   field 3: glob (string, optional)
- */
-function parseGrepArgs(data: Uint8Array): { pattern: string; path?: string; glob?: string } {
-  const fields = parseProtoFields(data);
-  let pattern = '';
-  let path: string | undefined;
-  let glob: string | undefined;
-
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      pattern = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      path = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      glob = new TextDecoder().decode(field.value);
-    }
-  }
-
-  return { pattern, path, glob };
-}
-
-/**
- * Parse write_args
- * WriteArgs:
- *   field 1: path (string)
- *   field 2: file_text (string)
- *   field 3: tool_call_id (string)
- *   field 4: return_file_content_after_write (bool)
- *   field 5: file_bytes (bytes)
- */
-function parseWriteArgs(data: Uint8Array): { 
-  path: string; 
-  fileText: string; 
-  toolCallId?: string;
-  returnFileContentAfterWrite?: boolean;
-  fileBytes?: Uint8Array;
-} {
-  const fields = parseProtoFields(data);
-  let path = '';
-  let fileText = '';
-  let toolCallId: string | undefined;
-  let returnFileContentAfterWrite: boolean | undefined;
-  let fileBytes: Uint8Array | undefined;
-
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      path = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      fileText = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      toolCallId = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 4 && field.wireType === 0) {
-      returnFileContentAfterWrite = field.value === 1;
-    } else if (field.fieldNumber === 5 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      fileBytes = field.value;
-    }
-  }
-
-  return { path, fileText, toolCallId, returnFileContentAfterWrite, fileBytes };
-}
-
-/**
- * Parse ExecServerMessage to extract all exec types
- * ExecServerMessage:
- *   field 1: id (uint32)
- *   field 15: exec_id (string)
- *   field 2: shell_args (ShellArgs)
- *   field 8: ls_args (LsArgs)
- *   field 10: request_context_args (RequestContextArgs)
- *   field 11: mcp_args (McpArgs)
- *   field 14: shell_stream_args (ShellArgs)
- */
-function parseExecServerMessage(data: Uint8Array): ExecRequest | null {
-  const fields = parseProtoFields(data);
-  let id = 0;
-  let execId: string | undefined = undefined;
-  let result: ExecRequest | null = null;
-
-  // First pass: get id and execId
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 0) {
-      id = field.value as number;
-    } else if (field.fieldNumber === 15 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      execId = new TextDecoder().decode(field.value);
-    }
-  }
-
-  // Second pass: get the exec type
-  for (const field of fields) {
-    if (field.wireType !== 2 || !(field.value instanceof Uint8Array)) continue;
-
-    switch (field.fieldNumber) {
-      case 2: // shell_args
-      case 14: { // shell_stream_args
-        const shellArgs = parseShellArgs(field.value);
-        result = { type: 'shell', id, execId, command: shellArgs.command, cwd: shellArgs.cwd };
-        break;
-      }
-      case 3: { // write_args
-        const writeArgs = parseWriteArgs(field.value);
-        result = { 
-          type: 'write', 
-          id, 
-          execId, 
-          path: writeArgs.path, 
-          fileText: writeArgs.fileText,
-          toolCallId: writeArgs.toolCallId,
-          returnFileContentAfterWrite: writeArgs.returnFileContentAfterWrite,
-          fileBytes: writeArgs.fileBytes
-        };
-        break;
-      }
-      case 5: { // grep_args (also used for glob)
-        const grepArgs = parseGrepArgs(field.value);
-        result = { type: 'grep', id, execId, pattern: grepArgs.pattern, path: grepArgs.path, glob: grepArgs.glob };
-        break;
-      }
-      case 7: { // read_args
-        const readArgs = parseReadArgs(field.value);
-        result = { type: 'read', id, execId, path: readArgs.path };
-        break;
-      }
-      case 8: { // ls_args
-        const lsArgs = parseLsArgs(field.value);
-        result = { type: 'ls', id, execId, path: lsArgs.path };
-        break;
-      }
-      case 10: { // request_context_args
-        result = { type: 'request_context', id, execId };
-        break;
-      }
-      case 11: { // mcp_args
-        const mcpArgs = parseMcpArgs(field.value);
-        result = { type: 'mcp', id, execId, ...mcpArgs };
-        break;
-      }
-    }
-
-    if (result) {
-      debugLog(`[DEBUG] Parsed ExecServerMessage: type=${result.type}, id=${id}`);
-      break;
-    }
-  }
-
-  return result;
-}
-
-// --- Exec Response Builders ---
-
-/**
- * Build McpTextContent message
- * field 1: text (string)
- */
-function encodeMcpTextContent(text: string): Uint8Array {
-  return encodeStringField(1, text);
-}
-
-/**
- * Build McpToolResultContentItem with text content
- * field 1: text (McpTextContent) - oneof content
- */
-function encodeMcpToolResultContentItem(text: string): Uint8Array {
-  const textContent = encodeMcpTextContent(text);
-  return encodeMessageField(1, textContent);
-}
-
-/**
- * Build McpSuccess message
- * field 1: content (repeated McpToolResultContentItem)
- * field 2: is_error (bool)
- */
-function encodeMcpSuccess(content: string, isError: boolean = false): Uint8Array {
-  const parts: Uint8Array[] = [];
-
-  // Add content item
-  const contentItem = encodeMcpToolResultContentItem(content);
-  parts.push(encodeMessageField(1, contentItem));
-
-  // Add is_error if true
-  if (isError) {
-    parts.push(encodeBoolField(2, true));
-  }
-
-  return concatBytes(...parts);
-}
-
-/**
- * Build McpError message
- * field 1: error (string)
- */
-function encodeMcpError(error: string): Uint8Array {
-  return encodeStringField(1, error);
-}
-
-/**
- * Build McpResult message
- * field 1: success (McpSuccess) - oneof result
- * field 2: error (McpError) - oneof result
- */
-function encodeMcpResult(result: { success?: { content: string; isError?: boolean }; error?: string }): Uint8Array {
-  if (result.success) {
-    const success = encodeMcpSuccess(result.success.content, result.success.isError);
-    return encodeMessageField(1, success);
-  } else if (result.error) {
-    const error = encodeMcpError(result.error);
-    return encodeMessageField(2, error);
-  }
-
-  // Default to empty success
-  return encodeMessageField(1, encodeMcpSuccess(""));
-}
-
-/**
- * Build ExecClientMessage with mcp_result
- * ExecClientMessage:
- *   field 1: id (uint32)
- *   field 15: exec_id (string) - optional
- *   field 11: mcp_result (McpResult) - oneof message
- */
+// --- Types are now imported from ./proto ---
+// ExecRequest types, ToolCallInfo, AgentStreamChunk, AgentServiceOptions, AgentChatRequest
+// are all imported from ./proto/types via the barrel export
+
+// Local aliases for the buildExecClientMessageWithMcpResult function which needs a slightly different signature
 function buildExecClientMessage(
   id: number,
   execId: string | undefined,
   result: { success?: { content: string; isError?: boolean }; error?: string }
 ): Uint8Array {
-  const parts: Uint8Array[] = [];
-
-  // field 1: id
-  parts.push(encodeUint32Field(1, id));
-
-  // field 15: exec_id (optional)
-  if (execId) {
-    parts.push(encodeStringField(15, execId));
-  }
-
-  // field 11: mcp_result
-  const mcpResult = encodeMcpResult(result);
-  parts.push(encodeMessageField(11, mcpResult));
-
-  return concatBytes(...parts);
-}
-
-/**
- * Build ExecClientStreamClose message
- * field 1: id (uint32)
- */
-function encodeExecClientStreamClose(id: number): Uint8Array {
-  return encodeUint32Field(1, id);
-}
-
-/**
- * Build ExecClientControlMessage with stream_close
- * ExecClientControlMessage:
- *   field 1: stream_close (ExecClientStreamClose) - oneof message
- */
-function buildExecClientControlMessage(id: number): Uint8Array {
-  const streamClose = encodeExecClientStreamClose(id);
-  return encodeMessageField(1, streamClose);
-}
-
-/**
- * Build AgentClientMessage with exec_client_message
- * AgentClientMessage:
- *   field 2: exec_client_message (ExecClientMessage)
- */
-function buildAgentClientMessageWithExec(execClientMessage: Uint8Array): Uint8Array {
-  return encodeMessageField(2, execClientMessage);
-}
-
-/**
- * Build ShellResult message with proper nested structure
- * ShellResult:
- *   field 1: success (ShellSuccess) - oneof result
- *   field 2: failure (ShellFailure) - oneof result
- * ShellSuccess/ShellFailure:
- *   field 1: command (string)
- *   field 2: working_directory (string)
- *   field 3: exit_code (int32)
- *   field 4: signal (string)
- *   field 5: stdout (string)
- *   field 6: stderr (string)
- *   field 7: execution_time (int32) - optional
- */
-function encodeShellResult(command: string, cwd: string, stdout: string, stderr: string, exitCode: number, executionTimeMs?: number): Uint8Array {
-  // Build ShellSuccess or ShellFailure (same structure, different field number in result)
-  const shellOutcome = concatBytes(
-    encodeStringField(1, command),
-    encodeStringField(2, cwd),
-    encodeInt32Field(3, exitCode),
-    encodeStringField(4, ""),  // signal (empty)
-    encodeStringField(5, stdout),
-    encodeStringField(6, stderr),
-    executionTimeMs ? encodeInt32Field(7, executionTimeMs) : new Uint8Array(0),
-  );
-
-  // Wrap in ShellResult - field 1 for success, field 2 for failure
-  const resultField = exitCode === 0 ? 1 : 2;
-  return encodeMessageField(resultField, shellOutcome);
-}
-
-/**
- * Build ExecClientMessage with shell_result
- * ExecClientMessage:
- *   field 1: id (uint32)
- *   field 15: exec_id (string) - optional
- *   field 2: shell_result (ShellResult) - oneof message
- */
-function buildExecClientMessageWithShellResult(
-  id: number,
-  execId: string | undefined,
-  command: string,
-  cwd: string,
-  stdout: string,
-  stderr: string,
-  exitCode: number,
-  executionTimeMs?: number
-): Uint8Array {
-  const parts: Uint8Array[] = [];
-  parts.push(encodeUint32Field(1, id));
-  if (execId) {
-    parts.push(encodeStringField(15, execId));
-  }
-  parts.push(encodeMessageField(2, encodeShellResult(command, cwd, stdout, stderr, exitCode, executionTimeMs)));
-  return concatBytes(...parts);
-}
-
-/**
- * Build LsResult message
- * LsResult:
- *   field 1: success (LsSuccess) - oneof result
- * LsSuccess:
- *   field 1: files_string (string)
- */
-function encodeLsResult(filesString: string): Uint8Array {
-  const lsSuccess = encodeStringField(1, filesString);
-  return encodeMessageField(1, lsSuccess);
-}
-
-/**
- * Build ExecClientMessage with ls_result
- * ExecClientMessage:
- *   field 1: id (uint32)
- *   field 15: exec_id (string) - optional
- *   field 8: ls_result (LsResult) - oneof message
- */
-function buildExecClientMessageWithLsResult(id: number, execId: string | undefined, filesString: string): Uint8Array {
-  const parts: Uint8Array[] = [];
-  parts.push(encodeUint32Field(1, id));
-  if (execId) {
-    parts.push(encodeStringField(15, execId));
-  }
-  parts.push(encodeMessageField(8, encodeLsResult(filesString)));
-  return concatBytes(...parts);
-}
-
-/**
- * Build RequestContextResult message
- * RequestContextResult:
- *   field 1: success (RequestContextSuccess) - oneof result
- * RequestContextSuccess:
- *   field 1: request_context (RequestContext)
- * RequestContext:
- *   field 4: env (RequestContextEnv)
- */
-function encodeRequestContextResult(): Uint8Array {
-  const cwd = process.cwd();
-  const osVersion = `darwin ${require('os').release()}`;
-  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  const shell = process.env.SHELL || '/bin/zsh';
-
-  // RequestContextEnv
-  const env = concatBytes(
-    encodeStringField(1, osVersion),
-    encodeStringField(2, cwd),
-    encodeStringField(3, shell),
-    encodeStringField(10, timeZone),
-    encodeStringField(11, cwd),
-  );
-
-  // RequestContext
-  const requestContext = encodeMessageField(4, env);
-
-  // RequestContextSuccess
-  const success = encodeMessageField(1, requestContext);
-
-  // RequestContextResult
-  return encodeMessageField(1, success);
-}
-
-/**
- * Build ExecClientMessage with request_context_result
- * ExecClientMessage:
- *   field 1: id (uint32)
- *   field 15: exec_id (string) - optional
- *   field 10: request_context_result (RequestContextResult) - oneof message
- */
-function buildExecClientMessageWithRequestContextResult(id: number, execId: string | undefined): Uint8Array {
-  const parts: Uint8Array[] = [];
-  parts.push(encodeUint32Field(1, id));
-  if (execId) {
-    parts.push(encodeStringField(15, execId));
-  }
-  parts.push(encodeMessageField(10, encodeRequestContextResult()));
-  return concatBytes(...parts);
-}
-
-/**
- * Build ReadResult message
- * ReadResult:
- *   field 1: success (ReadSuccess) - oneof result
- *   field 2: error (ReadError) - oneof result
- *   field 3: rejected (ReadRejected) - oneof result
- *   field 4: file_not_found (ReadFileNotFound) - oneof result
- *   field 5: permission_denied (ReadPermissionDenied) - oneof result
- *
- * ReadSuccess:
- *   field 1: path (string) - the file path that was read
- *   field 2: content (string) - oneof output (for text files)
- *   field 3: total_lines (int32)
- *   field 4: file_size (int64)
- *   field 5: data (bytes) - oneof output (for binary/image files)
- *   field 6: truncated (bool)
- */
-function encodeReadResult(content: string, path: string, totalLines?: number, fileSize?: bigint, truncated?: boolean): Uint8Array {
-  const parts: Uint8Array[] = [];
-
-  // field 1: path (required)
-  parts.push(encodeStringField(1, path));
-
-  // field 2: content (oneof output - for text files)
-  parts.push(encodeStringField(2, content));
-
-  // field 3: total_lines
-  if (totalLines !== undefined && totalLines > 0) {
-    parts.push(encodeInt32Field(3, totalLines));
-  }
-
-  // field 4: file_size
-  if (fileSize !== undefined) {
-    parts.push(encodeInt64Field(4, fileSize));
-  }
-
-  // field 6: truncated
-  if (truncated) {
-    parts.push(encodeBoolField(6, true));
-  }
-
-  const readSuccess = concatBytes(...parts);
-  return encodeMessageField(1, readSuccess);
-}
-
-/**
- * Build ExecClientMessage with read_result
- * ExecClientMessage:
- *   field 1: id (uint32)
- *   field 15: exec_id (string) - optional
- *   field 7: read_result (ReadResult) - oneof message
- */
-function buildExecClientMessageWithReadResult(
-  id: number,
-  execId: string | undefined,
-  content: string,
-  path: string,
-  totalLines?: number,
-  fileSize?: bigint,
-  truncated?: boolean
-): Uint8Array {
-  const parts: Uint8Array[] = [];
-  parts.push(encodeUint32Field(1, id));
-  if (execId) {
-    parts.push(encodeStringField(15, execId));
-  }
-  parts.push(encodeMessageField(7, encodeReadResult(content, path, totalLines, fileSize, truncated)));
-  return concatBytes(...parts);
-}
-
-/**
- * Build GrepFilesResult message
- * GrepFilesResult:
- *   field 1: files (repeated string) - list of matching file paths
- *   field 2: total_files (int32)
- *   field 3: client_truncated (bool)
- *   field 4: ripgrep_truncated (bool)
- */
-function encodeGrepFilesResult(files: string[], totalFiles: number, truncated: boolean = false): Uint8Array {
-  const parts: Uint8Array[] = [];
-
-  // field 1: files (repeated string)
-  for (const file of files) {
-    parts.push(encodeStringField(1, file));
-  }
-
-  // field 2: total_files
-  parts.push(encodeInt32Field(2, totalFiles));
-
-  // field 3: client_truncated
-  if (truncated) {
-    parts.push(encodeBoolField(3, true));
-  }
-
-  return concatBytes(...parts);
-}
-
-/**
- * Build GrepUnionResult message with files result
- * GrepUnionResult:
- *   field 2: files (GrepFilesResult) - oneof result
- */
-function encodeGrepUnionResult(files: string[], totalFiles: number, truncated: boolean = false): Uint8Array {
-  const filesResult = encodeGrepFilesResult(files, totalFiles, truncated);
-  return encodeMessageField(2, filesResult);
-}
-
-/**
- * Build GrepSuccess message
- * GrepSuccess:
- *   field 1: pattern (string)
- *   field 2: path (string)
- *   field 3: output_mode (string) - "files_with_matches"
- *   field 4: workspace_results (map<string, GrepUnionResult>)
- */
-function encodeGrepSuccess(pattern: string, path: string, files: string[]): Uint8Array {
-  const parts: Uint8Array[] = [];
-
-  // field 1: pattern
-  parts.push(encodeStringField(1, pattern));
-
-  // field 2: path
-  parts.push(encodeStringField(2, path));
-
-  // field 3: output_mode
-  parts.push(encodeStringField(3, "files_with_matches"));
-
-  // field 4: workspace_results - map entry: key=path, value=GrepUnionResult
-  // Map entry: field 1 = key (string), field 2 = value (GrepUnionResult)
-  const unionResult = encodeGrepUnionResult(files, files.length);
-  const mapEntry = concatBytes(
-    encodeStringField(1, path),
-    encodeMessageField(2, unionResult)
-  );
-  parts.push(encodeMessageField(4, mapEntry));
-
-  return concatBytes(...parts);
-}
-
-/**
- * Build GrepResult message
- * GrepResult:
- *   field 1: success (GrepSuccess) - oneof result
- *   field 2: error (GrepError) - oneof result
- */
-function encodeGrepResult(pattern: string, path: string, files: string[]): Uint8Array {
-  const success = encodeGrepSuccess(pattern, path, files);
-  return encodeMessageField(1, success);
-}
-
-/**
- * Build ExecClientMessage with grep_result
- * ExecClientMessage:
- *   field 1: id (uint32)
- *   field 15: exec_id (string) - optional
- *   field 5: grep_result (GrepResult) - oneof message
- */
-function buildExecClientMessageWithGrepResult(
-  id: number,
-  execId: string | undefined,
-  pattern: string,
-  path: string,
-  files: string[]
-): Uint8Array {
-  const parts: Uint8Array[] = [];
-  parts.push(encodeUint32Field(1, id));
-  if (execId) {
-    parts.push(encodeStringField(15, execId));
-  }
-  parts.push(encodeMessageField(5, encodeGrepResult(pattern, path, files)));
-  return concatBytes(...parts);
-}
-
-/**
- * Build WriteSuccess message
- * WriteSuccess:
- *   field 1: path (string)
- *   field 2: lines_created (int32)
- *   field 3: file_size (int32)
- *   field 4: file_content_after_write (string, optional)
- */
-function encodeWriteSuccess(path: string, linesCreated: number, fileSize: number, fileContentAfterWrite?: string): Uint8Array {
-  const parts: Uint8Array[] = [];
-  parts.push(encodeStringField(1, path));
-  parts.push(encodeInt32Field(2, linesCreated));
-  parts.push(encodeInt32Field(3, fileSize));
-  if (fileContentAfterWrite) {
-    parts.push(encodeStringField(4, fileContentAfterWrite));
-  }
-  return concatBytes(...parts);
-}
-
-/**
- * Build WriteError message
- * WriteError:
- *   field 1: path (string)
- *   field 2: error (string)
- */
-function encodeWriteError(path: string, error: string): Uint8Array {
-  return concatBytes(
-    encodeStringField(1, path),
-    encodeStringField(2, error)
-  );
-}
-
-/**
- * Build WriteResult message
- * WriteResult:
- *   field 1: success (WriteSuccess) - oneof result
- *   field 3: permission_denied (WritePermissionDenied) - oneof result  
- *   field 4: no_space (WriteNoSpace) - oneof result
- *   field 5: error (WriteError) - oneof result
- *   field 6: rejected (WriteRejected) - oneof result
- */
-function encodeWriteResult(result: { 
-  success?: { path: string; linesCreated: number; fileSize: number; fileContentAfterWrite?: string }; 
-  error?: { path: string; error: string };
-}): Uint8Array {
-  if (result.success) {
-    const success = encodeWriteSuccess(
-      result.success.path, 
-      result.success.linesCreated, 
-      result.success.fileSize,
-      result.success.fileContentAfterWrite
-    );
-    return encodeMessageField(1, success);
-  } else if (result.error) {
-    const error = encodeWriteError(result.error.path, result.error.error);
-    return encodeMessageField(5, error);
-  }
-  // Default to empty success
-  return encodeMessageField(1, encodeWriteSuccess("", 0, 0));
-}
-
-/**
- * Build ExecClientMessage with write_result
- * ExecClientMessage:
- *   field 1: id (uint32)
- *   field 15: exec_id (string) - optional
- *   field 3: write_result (WriteResult) - oneof message
- */
-function buildExecClientMessageWithWriteResult(
-  id: number,
-  execId: string | undefined,
-  result: { 
-    success?: { path: string; linesCreated: number; fileSize: number; fileContentAfterWrite?: string }; 
-    error?: { path: string; error: string };
-  }
-): Uint8Array {
-  const parts: Uint8Array[] = [];
-  parts.push(encodeUint32Field(1, id));
-  if (execId) {
-    parts.push(encodeStringField(15, execId));
-  }
-  parts.push(encodeMessageField(3, encodeWriteResult(result)));
-  return concatBytes(...parts);
-}
-
-/**
- * Build AgentClientMessage with exec_client_control_message
- * AgentClientMessage:
- *   field 5: exec_client_control_message (ExecClientControlMessage)
- */
-function buildAgentClientMessageWithExecControl(execClientControlMessage: Uint8Array): Uint8Array {
-  return encodeMessageField(5, execClientControlMessage);
-}
-
-// --- Tool Call Parsing ---
-
-/**
- * Tool type field number to name mapping
- * Based on agent.v1.ToolCall oneof field numbers
- */
-const TOOL_FIELD_MAP: Record<number, { type: string; name: string }> = {
-  1: { type: "shell_tool_call", name: "bash" },
-  3: { type: "delete_tool_call", name: "delete" },
-  4: { type: "glob_tool_call", name: "glob" },
-  5: { type: "grep_tool_call", name: "grep" },
-  8: { type: "read_tool_call", name: "read" },
-  9: { type: "update_todos_tool_call", name: "todowrite" },
-  10: { type: "read_todos_tool_call", name: "todoread" },
-  12: { type: "edit_tool_call", name: "edit" },
-  13: { type: "ls_tool_call", name: "list" },
-  14: { type: "read_lints_tool_call", name: "read_lints" },
-  15: { type: "mcp_tool_call", name: "mcp" },
-  16: { type: "sem_search_tool_call", name: "semantic_search" },
-  17: { type: "create_plan_tool_call", name: "create_plan" },
-  18: { type: "web_search_tool_call", name: "web_search" },
-  19: { type: "task_tool_call", name: "task" },
-  20: { type: "list_mcp_resources_tool_call", name: "list_mcp_resources" },
-  21: { type: "read_mcp_resource_tool_call", name: "read_mcp_resource" },
-  22: { type: "apply_agent_diff_tool_call", name: "apply_diff" },
-  23: { type: "ask_question_tool_call", name: "ask_question" },
-  24: { type: "fetch_tool_call", name: "webfetch" },
-  25: { type: "switch_mode_tool_call", name: "switch_mode" },
-  26: { type: "exa_search_tool_call", name: "exa_search" },
-  27: { type: "exa_fetch_tool_call", name: "exa_fetch" },
-  28: { type: "generate_image_tool_call", name: "generate_image" },
-  29: { type: "record_screen_tool_call", name: "record_screen" },
-  30: { type: "computer_use_tool_call", name: "computer_use" },
-};
-
-/**
- * Argument field mappings for each tool type
- * Maps protobuf field numbers to OpenAI-compatible argument names
- */
-const TOOL_ARG_SCHEMA: Record<string, Record<number, string>> = {
-  // ShellToolCall: field 1 = command, field 2 = thought, field 3 = working_directory
-  "shell_tool_call": { 1: "command", 2: "description", 3: "working_directory" },
-  // DeleteToolCall: field 1 = path
-  "delete_tool_call": { 1: "filePath" },
-  // GlobToolCall: field 1 = pattern, field 2 = path
-  "glob_tool_call": { 1: "pattern", 2: "path" },
-  // GrepToolCall: field 1 = pattern, field 2 = path, field 3 = include
-  "grep_tool_call": { 1: "pattern", 2: "path", 3: "include" },
-  // ReadToolCall: field 1 = path, field 2 = start_line, field 3 = end_line
-  "read_tool_call": { 1: "filePath", 2: "offset", 3: "limit" },
-  // UpdateTodosToolCall: field 1 = todos (repeated)
-  "update_todos_tool_call": { 1: "todos" },
-  // ReadTodosToolCall: no fields
-  "read_todos_tool_call": {},
-  // EditToolCall: field 1 = path, field 2 = old_string, field 3 = new_string, field 4 = replace_all
-  "edit_tool_call": { 1: "filePath", 2: "oldString", 3: "newString", 4: "replaceAll" },
-  // LsToolCall: field 1 = path, field 2 = ignore (repeated)
-  "ls_tool_call": { 1: "path", 2: "ignore" },
-  // ReadLintsToolCall: no special fields
-  "read_lints_tool_call": {},
-  // McpToolCall: field 1 = provider_identifier, field 2 = tool_name, field 3 = tool_call_id, field 4 = args
-  "mcp_tool_call": { 1: "provider_identifier", 2: "tool_name", 3: "tool_call_id", 4: "args" },
-  // SemSearchToolCall: field 1 = query, field 2 = path
-  "sem_search_tool_call": { 1: "query", 2: "path" },
-  // CreatePlanToolCall: field 1 = plan
-  "create_plan_tool_call": { 1: "plan" },
-  // WebSearchToolCall: field 1 = query
-  "web_search_tool_call": { 1: "query" },
-  // TaskToolCall: field 1 = description, field 2 = prompt, field 3 = subagent_type
-  "task_tool_call": { 1: "description", 2: "prompt", 3: "subagent_type" },
-  // ListMcpResourcesToolCall: field 1 = provider_identifier
-  "list_mcp_resources_tool_call": { 1: "provider_identifier" },
-  // ReadMcpResourceToolCall: field 1 = provider_identifier, field 2 = uri
-  "read_mcp_resource_tool_call": { 1: "provider_identifier", 2: "uri" },
-  // ApplyAgentDiffToolCall: field 1 = path, field 2 = diff
-  "apply_agent_diff_tool_call": { 1: "filePath", 2: "diff" },
-  // AskQuestionToolCall: field 1 = question
-  "ask_question_tool_call": { 1: "question" },
-  // FetchToolCall: field 1 = url, field 2 = format
-  "fetch_tool_call": { 1: "url", 2: "format" },
-  // SwitchModeToolCall: field 1 = mode
-  "switch_mode_tool_call": { 1: "mode" },
-  // ExaSearchToolCall: field 1 = query
-  "exa_search_tool_call": { 1: "query" },
-  // ExaFetchToolCall: field 1 = url
-  "exa_fetch_tool_call": { 1: "url" },
-  // GenerateImageToolCall: field 1 = prompt
-  "generate_image_tool_call": { 1: "prompt" },
-  // RecordScreenToolCall: field 1 = duration
-  "record_screen_tool_call": { 1: "duration" },
-  // ComputerUseToolCall: various fields
-  "computer_use_tool_call": { 1: "action", 2: "text", 3: "coordinate" },
-};
-
-/**
- * Parse a ToolCall message to extract tool type and arguments
- */
-function parseToolCall(data: Uint8Array): { toolType: string; name: string; arguments: Record<string, any> } {
-  const fields = parseProtoFields(data);
-  let toolType = "unknown";
-  let name = "unknown";
-  const args: Record<string, any> = {};
-
-  for (const field of fields) {
-    const toolInfo = TOOL_FIELD_MAP[field.fieldNumber];
-    if (toolInfo && field.wireType === 2 && field.value instanceof Uint8Array) {
-      toolType = toolInfo.type;
-      name = toolInfo.name;
-
-      // Get the argument schema for this tool type
-      const argSchema = TOOL_ARG_SCHEMA[toolType] || {};
-
-      // Parse the nested tool-specific message to extract arguments
-      const toolFields = parseProtoFields(field.value);
-      for (const tf of toolFields) {
-        // Get the proper argument name from schema, or fall back to field_N
-        const argName = argSchema[tf.fieldNumber] || `field_${tf.fieldNumber}`;
-
-        if (tf.wireType === 2 && tf.value instanceof Uint8Array) {
-          // Try to decode as string first
-          try {
-            let strValue = new TextDecoder().decode(tf.value);
-
-            // Check if this looks like a nested protobuf message (starts with field tag)
-            // Common pattern: field 1 (tag 0x0a) followed by length then string
-            if (tf.value.length > 2 && tf.value[0] === 0x0a) {
-              // This is likely a nested message with a string in field 1
-              const nestedFields = parseProtoFields(tf.value);
-              for (const nf of nestedFields) {
-                if (nf.fieldNumber === 1 && nf.wireType === 2 && nf.value instanceof Uint8Array) {
-                  strValue = new TextDecoder().decode(nf.value);
-                  break;
-                }
-              }
-            }
-
-            args[argName] = strValue;
-          } catch {
-            args[argName] = `<binary:${tf.value.length}bytes>`;
-          }
-        } else if (tf.wireType === 0) {
-          // Varint - could be int, bool, etc.
-          // For boolean fields like replaceAll, convert to boolean
-          if (argName === "replaceAll") {
-            args[argName] = tf.value === 1;
-          } else {
-            args[argName] = tf.value;
-          }
-        }
-      }
-      break; // Found the tool, stop
-    }
-  }
-
-  return { toolType, name, arguments: args };
-}
-
-/**
- * Parse ToolCallStartedUpdate message
- * field 1: call_id (string)
- * field 2: tool_call (ToolCall message)
- * field 3: model_call_id (string)
- */
-function parseToolCallStartedUpdate(data: Uint8Array): { callId: string; modelCallId: string; toolCall: { toolType: string; name: string; arguments: Record<string, any> } | null } {
-  const fields = parseProtoFields(data);
-  let callId = "";
-  let modelCallId = "";
-  let toolCall: { toolType: string; name: string; arguments: Record<string, any> } | null = null;
-
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      callId = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      toolCall = parseToolCall(field.value);
-    } else if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      modelCallId = new TextDecoder().decode(field.value);
-    }
-  }
-
-  return { callId, modelCallId, toolCall };
-}
-
-/**
- * Parse PartialToolCallUpdate message
- * field 1: call_id (string)
- * field 2: tool_call (ToolCall message) - optional
- * field 3: args_text_delta (string) - partial JSON args
- * field 4: model_call_id (string)
- */
-function parsePartialToolCallUpdate(data: Uint8Array): { callId: string; modelCallId: string; argsTextDelta: string; toolCall: { toolType: string; name: string; arguments: Record<string, any> } | null } {
-  const fields = parseProtoFields(data);
-  let callId = "";
-  let modelCallId = "";
-  let argsTextDelta = "";
-  let toolCall: { toolType: string; name: string; arguments: Record<string, any> } | null = null;
-
-  for (const field of fields) {
-    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      callId = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      toolCall = parseToolCall(field.value);
-    } else if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      argsTextDelta = new TextDecoder().decode(field.value);
-    } else if (field.fieldNumber === 4 && field.wireType === 2 && field.value instanceof Uint8Array) {
-      modelCallId = new TextDecoder().decode(field.value);
-    }
-  }
-
-  return { callId, modelCallId, argsTextDelta, toolCall };
-}
-
-// --- Stream Chunk Types ---
-
-/**
- * Tool call information extracted from Cursor's ToolCall message
- */
-export interface ToolCallInfo {
-  callId: string;
-  modelCallId?: string;
-  toolType: string;       // e.g., "shell_tool_call", "read_tool_call", etc.
-  name: string;           // human-readable name
-  arguments: string;      // JSON string of arguments
-}
-
-export interface AgentStreamChunk {
-  type: "text" | "thinking" | "token" | "checkpoint" | "done" | "error" | "tool_call_started" | "tool_call_completed" | "partial_tool_call" | "exec_request" | "heartbeat" | "exec_server_abort" | "interaction_query" | "kv_blob_assistant";
-  content?: string;
-  error?: string;
-  toolCall?: ToolCallInfo;
-  partialArgs?: string;   // For partial_tool_call updates
-  execRequest?: ExecRequest;  // For exec_request chunks - tool execution needed
-  queryId?: number;       // For interaction_query - the query ID to respond with
-  queryType?: string;     // For interaction_query - web_search, ask_question, switch_mode, etc.
-  blobContent?: string;   // For kv_blob_assistant - extracted assistant content from KV blob
-}
-
-// --- Agent Service Client ---
-
-export interface AgentServiceOptions {
-  baseUrl?: string;
-  privacyMode?: boolean;
-  workspacePath?: string;
-}
-
-export interface AgentChatRequest {
-  message: string;
-  model?: string;
-  mode?: AgentMode;
-  conversationId?: string;
-  tools?: OpenAIToolDefinition[];
+  return buildExecClientMessageWithMcpResult(id, execId, result);
 }
 
 export class AgentServiceClient {
@@ -2018,7 +506,7 @@ export class AgentServiceClient {
 
   // For tool result submission during streaming
   private currentRequestId: string | null = null;
-  private currentAppendSeqno: bigint = 0n;
+  private currentAppendSeqno = 0n;
   
   // For session reuse - track assistant responses stored in KV blobs
   // When Cursor stores model responses in blobs instead of streaming, we need to extract them
@@ -2119,8 +607,12 @@ export class AgentServiceClient {
       const bytes = new Uint8Array(responseBody);
       // Parse as gRPC-Web envelope
       if (bytes.length >= 5) {
-        const flags = bytes[0];
-        const length = (bytes[1]! << 24) | (bytes[2]! << 16) | (bytes[3]! << 8) | bytes[4]!;
+        const flags = bytes[0] ?? 0;
+        const b1 = bytes[1] ?? 0;
+        const b2 = bytes[2] ?? 0;
+        const b3 = bytes[3] ?? 0;
+        const b4 = bytes[4] ?? 0;
+        const length = (b1 << 24) | (b2 << 16) | (b3 << 8) | b4;
         debugLog(`[DEBUG] BidiAppend response: flags=${flags}, length=${length}, totalBytes=${bytes.length}`);
         if (length > 0 && bytes.length >= 5 + length) {
           const payload = bytes.slice(5, 5 + length);
@@ -2135,7 +627,7 @@ export class AgentServiceClient {
    */
   private analyzeBlobData(data: Uint8Array): {
     type: 'json' | 'text' | 'protobuf' | 'binary';
-    json?: any;
+    json?: Record<string, unknown>;
     text?: string;
     protoFields?: Array<{ num: number; wire: number; size: number; text?: string }>;
   } {
@@ -2205,7 +697,9 @@ export class AgentServiceClient {
 
       await this.bidiAppend(requestId, appendSeqno, responseMsg);
       return appendSeqno + 1n;
-    } else if (kvMsg.messageType === 'set_blob_args' && kvMsg.blobId && kvMsg.blobData) {
+    }
+
+    if (kvMsg.messageType === 'set_blob_args' && kvMsg.blobId && kvMsg.blobData) {
       const key = this.blobIdToKey(kvMsg.blobId);
       this.blobStore.set(key, kvMsg.blobData);
 
@@ -2241,7 +735,7 @@ export class AgentServiceClient {
             }
           } else if (content === null || content === undefined) {
             // Content might be null for tool-calling responses
-            debugLog(`[KV-BLOB]   Assistant content is null/undefined (likely tool-calling response)`);
+            debugLog("[KV-BLOB]   Assistant content is null/undefined (likely tool-calling response)");
           }
         }
         // Check for tool_calls in assistant messages
@@ -2275,7 +769,7 @@ export class AgentServiceClient {
         debugLog(`[KV-BLOB]   Text preview: ${blobAnalysis.text?.slice(0, 200)}...`);
         // Check if text looks like a model response (starts with text, not JSON/protobuf markers)
         if (blobAnalysis.text && !blobAnalysis.text.startsWith('{') && !blobAnalysis.text.startsWith('[') && blobAnalysis.text.length > 50) {
-          debugLog(`[KV-BLOB]   Possible plain text response - check manually`);
+          debugLog("[KV-BLOB]   Possible plain text response - check manually");
         }
       } else if (blobAnalysis.type === 'protobuf') {
         debugLog(`[KV-BLOB]   Protobuf fields: ${blobAnalysis.protoFields?.map(f => `f${f.num}:w${f.wire}(${f.size}b)`).join(', ')}`);
@@ -2625,7 +1119,7 @@ export class AgentServiceClient {
   /**
    * Send a streaming chat request using BidiSse pattern
    */
-  async *chatStream(request: AgentChatRequest): AsyncGenerator<AgentStreamChunk> {
+  async *chatStream(request: AgentChatRequest): AsyncGenerator<AgentStreamChunkType> {
     const metrics = createTimingMetrics();
     const requestId = randomUUID();
 
@@ -2725,11 +1219,12 @@ export class AgentServiceClient {
           // Parse frames
           let offset = 0;
           while (offset + 5 <= buffer.length) {
-            const flags = buffer[offset];
-            const length = (buffer[offset + 1]! << 24) |
-                          (buffer[offset + 2]! << 16) |
-                          (buffer[offset + 3]! << 8) |
-                          buffer[offset + 4]!;
+            const flags = buffer[offset] ?? 0;
+            const b1 = buffer[offset + 1] ?? 0;
+            const b2 = buffer[offset + 2] ?? 0;
+            const b3 = buffer[offset + 3] ?? 0;
+            const b4 = buffer[offset + 4] ?? 0;
+            const length = (b1 << 24) | (b2 << 16) | (b3 << 8) | b4;
 
             if (offset + 5 + length > buffer.length) break;
 
@@ -2979,9 +1474,10 @@ export class AgentServiceClient {
                   };
                   markProgress();
                 }
-              } catch (parseErr: any) {
-                console.error("Error parsing field:", field.fieldNumber, parseErr);
-                yield { type: "error", error: `Parse error in field ${field.fieldNumber}: ${parseErr.message}` };
+              } catch (parseErr) {
+                const error = parseErr instanceof Error ? parseErr : new Error(String(parseErr));
+                console.error("Error parsing field:", field.fieldNumber, error);
+                yield { type: "error", error: `Parse error in field ${field.fieldNumber}: ${error.message}` };
               }
             }
 
