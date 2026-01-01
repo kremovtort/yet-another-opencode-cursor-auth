@@ -285,6 +285,11 @@ async function streamChatCompletion(params: StreamParams): Promise<Response> {
                 createStreamChunk(completionId, model, created, { content: chunk.content })
               )));
             }
+          } else if (chunk.type === "kv_blob_assistant" && chunk.blobContent) {
+            log("[OpenAI Compat] Emitting assistant content from KV blob");
+            controller.enqueue(encoder.encode(createSSEChunk(
+              createStreamChunk(completionId, model, created, { content: chunk.blobContent })
+            )));
           } else if (chunk.type === "tool_call_started" && chunk.toolCall) {
             // Track file-modifying tool calls
             if (chunk.toolCall.name === "edit" || chunk.toolCall.name === "apply_diff") {

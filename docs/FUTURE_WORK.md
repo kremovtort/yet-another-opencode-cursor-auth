@@ -44,19 +44,31 @@ This document outlines planned improvements and potential future directions for 
 ## Medium Priority
 
 ### 4. Session Reuse (Experimental)
-**Status**: Blocked  
+**Status**: In Progress  
 **Priority**: Medium
 
 Session reuse via BidiAppend would significantly reduce latency by avoiding the ~3-6s bootstrap per request. Currently blocked due to KV blob storage issue.
 
-**Research needed**:
+**Implemented**:
+- [x] Timing instrumentation (`CURSOR_TIMING=1`) for measuring bottlenecks
+- [x] KV blob analysis and assistant content extraction
+- [x] `kv_blob_assistant` chunk type for emitting extracted content
+- [x] Handler support for `kv_blob_assistant` → text streaming
+
+**Research findings** (see `docs/TOOL_CALLING_INVESTIGATION.md`):
+- After BidiAppend with tool results, Cursor stores responses in KV blobs instead of streaming
+- Assistant blobs may contain text OR tool calls (infinite loop observed)
+- `turn_ended` never fires in same-session continuation
+- Fresh sessions work reliably; session reuse requires more protocol understanding
+
+**Next steps**:
 - [ ] Investigate Cursor CLI headers that enable streaming after BidiAppend
-- [ ] Explore KV blob extraction as alternative approach
 - [ ] Test with different Cursor client versions
 - [ ] Monitor if Cursor API behavior changes
+- [ ] Try `x-cursor-streaming: true` header variations
 
 **Potential solutions**:
-1. **KV Blob Extraction**: Poll blob store after heartbeat timeout, extract and emit text
+1. **KV Blob Extraction** (implemented): Poll blob store after heartbeat timeout, extract and emit text
 2. **Header Matching**: Find correct headers that trigger streaming mode
 3. **Hybrid Approach**: Fresh sessions for tool calls, session reuse for simple chat
 
@@ -83,13 +95,31 @@ Session reuse via BidiAppend would significantly reduce latency by avoiding the 
 ## Low Priority
 
 ### 7. Performance Optimization
-**Status**: Planned  
+**Status**: In Progress  
 **Priority**: Low
 
+- [x] Timing instrumentation for request phases (message build, SSE connection, BidiAppend, first chunk/text/tool, turn ended)
+- [x] Performance logging via `CURSOR_TIMING=1` environment variable
 - [ ] Request batching for multiple concurrent calls
 - [ ] Response caching for identical requests
 - [ ] Connection keep-alive optimization
 - [ ] Memory usage profiling and optimization
+
+**Timing metrics available** (enable with `CURSOR_TIMING=1`):
+```
+[TIMING] ═══════════════════════════════════════════════════════
+[TIMING] Request Performance Summary
+[TIMING] ───────────────────────────────────────────────────────
+[TIMING]   Message build:     Xms
+[TIMING]   SSE connection:    Xms  
+[TIMING]   First BidiAppend:  Xms
+[TIMING]   First chunk:       Xms
+[TIMING]   First text:        Xms
+[TIMING]   First tool call:   Xms
+[TIMING]   Turn ended:        Xms
+[TIMING]   Total:             Xms
+[TIMING] ═══════════════════════════════════════════════════════
+```
 
 ### 8. Observability
 **Status**: Planned  
@@ -130,6 +160,29 @@ Areas to investigate:
 - [ ] What headers/flags trigger different response modes?
 - [ ] How does Cursor CLI handle multi-turn conversations?
 - [ ] What's the role of checkpoints in conversation state?
+
+### Native Cursor Provider for OpenCode
+**Status**: Exploratory  
+**Priority**: Long-term
+
+A native Cursor provider in OpenCode would provide the fastest possible integration by eliminating the OpenAI compatibility layer.
+
+**Benefits**:
+- Direct streaming without format translation
+- Native tool calling with Cursor's exec/MCP system
+- Zero protocol overhead
+- Full access to Cursor-specific features (thinking mode, checkpoints, etc.)
+
+**Challenges**:
+- Requires changes to OpenCode core
+- Would need to maintain provider alongside OpenAI-compat layer
+- Cursor's protocol may change frequently
+
+**Prerequisites**:
+- [ ] Document full Cursor Agent API protocol (largely done in `CURSOR_API.md`)
+- [ ] Understand remaining protobuf message types
+- [ ] Implement provider interface for OpenCode
+- [ ] Add Cursor-specific tool definitions
 
 ### Alternative Approaches
 **Status**: Exploratory

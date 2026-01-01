@@ -38,6 +38,68 @@ import { generateChecksum, addConnectEnvelope } from "./cursor-client";
 const DEBUG = process.env.CURSOR_DEBUG === "1";
 const debugLog = DEBUG ? console.log.bind(console) : () => {};
 
+// Performance timing - set CURSOR_TIMING=1 to enable timing logs (or CURSOR_DEBUG=1)
+const TIMING_ENABLED = process.env.CURSOR_TIMING === "1" || DEBUG;
+const timingLog = TIMING_ENABLED ? console.log.bind(console) : () => {};
+
+/**
+ * Performance metrics for a single chat request
+ */
+export interface ChatTimingMetrics {
+  requestStart: number;
+  messageBuildMs?: number;
+  sseConnectionMs?: number;
+  firstBidiAppendMs?: number;
+  firstChunkMs?: number;
+  firstTextMs?: number;
+  firstToolCallMs?: number;
+  turnEndedMs?: number;
+  totalMs?: number;
+  chunkCount: number;
+  textChunks: number;
+  toolCalls: number;
+  execRequests: number;
+  kvMessages: number;
+  heartbeats: number;
+}
+
+/**
+ * Create empty timing metrics
+ */
+function createTimingMetrics(): ChatTimingMetrics {
+  return {
+    requestStart: Date.now(),
+    chunkCount: 0,
+    textChunks: 0,
+    toolCalls: 0,
+    execRequests: 0,
+    kvMessages: 0,
+    heartbeats: 0,
+  };
+}
+
+function logTimingMetrics(metrics: ChatTimingMetrics): void {
+  const total = Date.now() - metrics.requestStart;
+  metrics.totalMs = total;
+  
+  timingLog("[TIMING] ═══════════════════════════════════════════════════════");
+  timingLog("[TIMING] Request Performance Summary");
+  timingLog("[TIMING] ───────────────────────────────────────────────────────");
+  timingLog("[TIMING]   Message build:     " + (metrics.messageBuildMs ?? "-") + "ms");
+  timingLog("[TIMING]   SSE connection:    " + (metrics.sseConnectionMs ?? "-") + "ms");
+  timingLog("[TIMING]   First BidiAppend:  " + (metrics.firstBidiAppendMs ?? "-") + "ms");
+  timingLog("[TIMING]   First chunk:       " + (metrics.firstChunkMs ?? "-") + "ms");
+  timingLog("[TIMING]   First text:        " + (metrics.firstTextMs ?? "-") + "ms");
+  timingLog("[TIMING]   First tool call:   " + (metrics.firstToolCallMs ?? "-") + "ms");
+  timingLog("[TIMING]   Turn ended:        " + (metrics.turnEndedMs ?? "-") + "ms");
+  timingLog("[TIMING]   Total:             " + total + "ms");
+  timingLog("[TIMING] ───────────────────────────────────────────────────────");
+  timingLog("[TIMING]   Chunks: " + metrics.chunkCount + " (text: " + metrics.textChunks + ", tools: " + metrics.toolCalls + ")");
+  timingLog("[TIMING]   Exec requests: " + metrics.execRequests + ", KV messages: " + metrics.kvMessages);
+  timingLog("[TIMING]   Heartbeats: " + metrics.heartbeats);
+  timingLog("[TIMING] ═══════════════════════════════════════════════════════");
+}
+
 // Cursor API URL (main API)
 export const CURSOR_API_URL = "https://api2.cursor.sh";
 
@@ -2564,11 +2626,11 @@ export class AgentServiceClient {
    * Send a streaming chat request using BidiSse pattern
    */
   async *chatStream(request: AgentChatRequest): AsyncGenerator<AgentStreamChunk> {
-    const startTime = Date.now();
+    const metrics = createTimingMetrics();
     const requestId = randomUUID();
 
     const messageBody = this.buildChatMessage(request);
-    const buildTime = Date.now() - startTime;
+    metrics.messageBuildMs = Date.now() - metrics.requestStart;
 
     let appendSeqno = 0n;
     // Heartbeats are frequent; be generous to avoid premature turn cuts
@@ -2609,13 +2671,13 @@ export class AgentServiceClient {
 
       // Send initial message
       await this.bidiAppend(requestId, appendSeqno++, messageBody);
-      const appendTime = Date.now() - startTime;
+      metrics.firstBidiAppendMs = Date.now() - metrics.requestStart;
       this.currentAppendSeqno = appendSeqno;
 
       const sseResponse = await ssePromise;
-      const responseTime = Date.now() - startTime;
+      metrics.sseConnectionMs = Date.now() - metrics.requestStart;
 
-      debugLog(`[TIMING] Request sent: build=${buildTime}ms, append=${appendTime}ms, response=${responseTime}ms`);
+      debugLog(`[TIMING] Request sent: build=${metrics.messageBuildMs}ms, append=${metrics.firstBidiAppendMs}ms, response=${metrics.sseConnectionMs}ms`);
 
       if (!sseResponse.ok) {
         clearTimeout(timeout);
@@ -2649,7 +2711,8 @@ export class AgentServiceClient {
           }
 
           if (!firstContentLogged) {
-            debugLog(`[TIMING] First chunk received in ${Date.now() - startTime}ms`);
+            metrics.firstChunkMs = Date.now() - metrics.requestStart;
+            debugLog(`[TIMING] First chunk received in ${metrics.firstChunkMs}ms`);
             firstContentLogged = true;
           }
 
@@ -2687,6 +2750,7 @@ export class AgentServiceClient {
             }
 
             // Parse AgentServerMessage
+            metrics.chunkCount++;
             const serverMsgFields = parseProtoFields(frameData);
             debugLog("[DEBUG] Server message fields:", serverMsgFields.map(f => `field${f.fieldNumber}:${f.wireType}`).join(", "));
 
@@ -2699,6 +2763,10 @@ export class AgentServiceClient {
 
                   // Yield text content
                   if (parsed.text) {
+                    if (metrics.firstTextMs === undefined) {
+                      metrics.firstTextMs = Date.now() - metrics.requestStart;
+                    }
+                    metrics.textChunks++;
                     yield { type: "text", content: parsed.text };
                     hasStreamedText = true;
                     markProgress();
@@ -2706,6 +2774,10 @@ export class AgentServiceClient {
 
                   // Yield tool call started
                   if (parsed.toolCallStarted) {
+                    if (metrics.firstToolCallMs === undefined) {
+                      metrics.firstToolCallMs = Date.now() - metrics.requestStart;
+                    }
+                    metrics.toolCalls++;
                     yield {
                       type: "tool_call_started",
                       toolCall: {
@@ -2751,11 +2823,13 @@ export class AgentServiceClient {
                   }
 
                   if (parsed.isComplete) {
+                    metrics.turnEndedMs = Date.now() - metrics.requestStart;
                     turnEnded = true;
                   }
 
                   // Yield heartbeat events for the server to track
                   if (parsed.isHeartbeat) {
+                    metrics.heartbeats++;
                     heartbeatSinceProgress++;
                     const idleMs = Date.now() - lastProgressAt;
                     const idleLimit = hasProgress ? HEARTBEAT_IDLE_MS_PROGRESS : HEARTBEAT_IDLE_MS_NOPROGRESS;
@@ -2817,6 +2891,7 @@ export class AgentServiceClient {
                     }
 
                     // Yield exec_request chunk for the server to handle
+                    metrics.execRequests++;
                     yield {
                       type: "exec_request",
                       execRequest,
@@ -2831,6 +2906,7 @@ export class AgentServiceClient {
 
                 // field 4 = kv_server_message
                 if (field.fieldNumber === 4 && field.wireType === 2 && field.value instanceof Uint8Array) {
+                  metrics.kvMessages++;
                   const kvMsg = parseKvServerMessage(field.value);
                   debugLog(`[DEBUG] KV message: id=${kvMsg.id}, type=${kvMsg.messageType}, blobId=${kvMsg.blobId ? Buffer.from(kvMsg.blobId).toString('hex').slice(0, 20) : 'none'}...`);
                   appendSeqno = await this.handleKvMessage(kvMsg, requestId, appendSeqno);
@@ -2920,6 +2996,7 @@ export class AgentServiceClient {
         // Clean exit - check for KV blob assistant responses if no text was streamed
         if (turnEnded) {
           controller.abort(); // Clean up the connection
+          logTimingMetrics(metrics);
           
           // Session reuse: If no text was streamed but we have pending assistant blobs,
           // emit them as kv_blob_assistant chunks so the server can use the content
@@ -2937,15 +3014,16 @@ export class AgentServiceClient {
         clearTimeout(timeout);
         this.currentRequestId = null;
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       clearTimeout(timeout);
       this.currentRequestId = null;
-      if (err.name === 'AbortError') {
+      const error = err as Error & { name?: string };
+      if (error.name === 'AbortError') {
         // Normal termination after turn ended
         return;
       }
-      console.error("Agent stream error:", err.name, err.message, err.stack);
-      yield { type: "error", error: err.message || String(err) };
+      console.error("Agent stream error:", error.name, error.message, (err as Error).stack);
+      yield { type: "error", error: error.message || String(err) };
     }
   }
 
