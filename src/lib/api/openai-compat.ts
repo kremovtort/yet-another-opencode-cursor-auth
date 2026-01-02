@@ -7,6 +7,7 @@ import {
   type ChatRequest,
   type StreamChunk,
 } from "./cursor-client";
+import { calculateTokenUsage } from "../utils/tokenizer";
 
 // Simple alias map to translate common OpenAI model identifiers to Cursor equivalents.
 const MODEL_ALIASES: Record<string, string> = {
@@ -257,6 +258,9 @@ export async function handleOpenAIChatCompletions(
     }
 
     const content = await client.chat(chatRequest);
+    const promptText = chatRequest.messages.map(m => m.content).join("\n");
+    const usage = calculateTokenUsage(promptText, content, chatRequest.model);
+    
     const responsePayload = {
       id: `cursor-${randomUUID()}`,
       object: "chat.completion",
@@ -272,11 +276,7 @@ export async function handleOpenAIChatCompletions(
           finish_reason: "stop",
         },
       ],
-      usage: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-      },
+      usage,
     };
 
     return new Response(JSON.stringify(responsePayload), {

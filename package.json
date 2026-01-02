@@ -70,9 +70,11 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@anthropic-ai/tokenizer": "^0.0.4",
     "@babel/generator": "^7.28.5",
     "@babel/parser": "^7.28.5",
     "@babel/types": "^7.28.5",
-    "@bufbuild/protobuf": "1.10.0"
+    "@bufbuild/protobuf": "1.10.0",
+    "gpt-tokenizer": "^3.4.0"
   }
 }

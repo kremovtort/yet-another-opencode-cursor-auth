@@ -34,6 +34,7 @@ import {
   createStreamChunk,
   generateToolCallId,
 } from "./utils";
+import { calculateTokenUsage } from "../utils/tokenizer";
 import type { CursorModelInfo } from "../api/cursor-models";
 
 // --- Model Cache ---
@@ -217,6 +218,7 @@ async function handleChatCompletions(
   // Non-streaming response
   try {
     const content = await client.chat({ message: prompt, model, mode: AgentMode.AGENT, tools });
+    const usage = calculateTokenUsage(prompt, content, model);
 
     return new Response(JSON.stringify({
       id: completionId,
@@ -228,11 +230,7 @@ async function handleChatCompletions(
         message: { role: "assistant", content },
         finish_reason: "stop",
       }],
-      usage: {
-        prompt_tokens: Math.ceil(prompt.length / 4),
-        completion_tokens: Math.ceil(content.length / 4),
-        total_tokens: Math.ceil((prompt.length + content.length) / 4),
-      },
+      usage,
     }), {
       headers: {
         "Content-Type": "application/json",
@@ -266,6 +264,7 @@ async function streamChatCompletion(params: StreamParams): Promise<Response> {
   let isClosed = false;
   let mcpToolCallIndex = 0;
   let pendingEditToolCall: string | null = null;
+  let accumulatedContent = "";
 
   const readable = new ReadableStream({
     async start(controller) {
@@ -281,12 +280,14 @@ async function streamChatCompletion(params: StreamParams): Promise<Response> {
 
           if (chunk.type === "text" || chunk.type === "token") {
             if (chunk.content) {
+              accumulatedContent += chunk.content;
               controller.enqueue(encoder.encode(createSSEChunk(
                 createStreamChunk(completionId, model, created, { content: chunk.content })
               )));
             }
           } else if (chunk.type === "kv_blob_assistant" && chunk.blobContent) {
             log("[OpenAI Compat] Emitting assistant content from KV blob");
+            accumulatedContent += chunk.blobContent;
             controller.enqueue(encoder.encode(createSSEChunk(
               createStreamChunk(completionId, model, created, { content: chunk.blobContent })
             )));
@@ -380,11 +381,22 @@ async function streamChatCompletion(params: StreamParams): Promise<Response> {
           }
         }
 
-        // Send final chunk
+        // Send final chunk with usage
         if (!isClosed) {
-          controller.enqueue(encoder.encode(createSSEChunk(
-            createStreamChunk(completionId, model, created, {}, "stop")
-          )));
+          const usage = calculateTokenUsage(prompt, accumulatedContent, model);
+          const finalChunk: OpenAIStreamChunk = {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: "stop",
+            }],
+            usage,
+          };
+          controller.enqueue(encoder.encode(createSSEChunk(finalChunk)));
           controller.enqueue(encoder.encode(createSSEDone()));
           controller.close();
         }
