@@ -13,30 +13,30 @@ This document outlines planned improvements and potential future directions for 
 ## High Priority
 
 ### 1. Error Handling & Resilience
-**Status**: Planned  
+**Status**: Partially Completed  
 **Priority**: High
 
-- [ ] Implement retry logic with exponential backoff for transient failures
-- [ ] Better error messages for common auth issues
+- [x] Implement retry logic with exponential backoff for transient failures (implemented in `login.ts` with 1.2x multiplier, max 10s delay)
+- [ ] Better error messages for common auth issues (basic messages exist, needs user-friendly improvements)
 - [ ] Graceful degradation when Cursor API is unavailable
 - [ ] Connection pooling for better performance
 
 ### 2. Streaming Reliability
-**Status**: Planned  
+**Status**: Partially Completed  
 **Priority**: High
 
-- [ ] Detect and recover from dropped SSE connections
-- [ ] Implement heartbeat monitoring to detect stale streams
-- [ ] Add timeout handling for long-running requests
-- [ ] Better handling of network interruptions
+- [x] Implement heartbeat monitoring to detect stale streams (implemented in `agent-service.ts` with idle detection)
+- [x] Add timeout handling for long-running requests (120s timeout implemented)
+- [ ] Detect and recover from dropped SSE connections (timeout exists but no automatic recovery)
+- [ ] Better handling of network interruptions (basic error handling exists, needs improvement)
 
 ### 3. Token Management
-**Status**: Planned  
+**Status**: Partially Completed  
 **Priority**: High
 
-- [ ] Proactive token refresh before expiration
-- [ ] Automatic re-authentication when tokens become invalid
-- [ ] Better handling of concurrent requests during token refresh
+- [x] Proactive token refresh before expiration (implemented via `isTokenExpiringSoon()` check in `helpers.ts`, refreshes when <5min remaining)
+- [x] Automatic re-authentication when tokens become invalid (`getValidAccessToken()` handles refresh automatically)
+- [ ] Better handling of concurrent requests during token refresh (not explicitly synchronized)
 - [ ] Support for token rotation
 
 ---
