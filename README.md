@@ -284,6 +284,16 @@ bun run demo:login     # Interactive login
 bun run demo:logout    # Clear credentials
 ```
 
+### Build artifacts
+
+This repo intentionally does not commit build output under `dist/`.
+
+```bash
+mkdir -p dist
+bun build src/index.ts --outfile dist/index.js
+bun build src/plugin/index.ts --outfile dist/plugin.js
+```
+
 ## Troubleshooting
 
 ### "No access token found"
