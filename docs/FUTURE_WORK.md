@@ -43,34 +43,38 @@ This document outlines planned improvements and potential future directions for 
 
 ## Medium Priority
 
-### 4. Session Reuse (Experimental)
-**Status**: In Progress  
-**Priority**: Medium
+### 4. Session Reuse
+**Status**: ❌ Not Feasible (Architectural Limitation)  
+**Priority**: Deprioritized
 
-Session reuse via BidiAppend would significantly reduce latency by avoiding the ~3-6s bootstrap per request. Currently blocked due to KV blob storage issue.
+**Conclusion**: True session reuse across OpenAI API requests is **not possible** due to a fundamental architectural mismatch between OpenAI's request/response model and Cursor's bidirectional streaming.
 
-**Implemented**:
-- [x] Timing instrumentation (`CURSOR_TIMING=1`) for measuring bottlenecks
-- [x] KV blob analysis and assistant content extraction
-- [x] `kv_blob_assistant` chunk type for emitting extracted content
-- [x] Handler support for `kv_blob_assistant` → text streaming
+**The Problem**:
+- OpenAI API must close HTTP response to return `tool_calls` to client
+- Client sends new HTTP request with tool results
+- This breaks the continuous streaming context that Cursor's `bidiAppend` relies on
+- BidiAppend sends tool results successfully, server acknowledges, but doesn't continue generating
 
-**Research findings** (see `docs/TOOL_CALLING_INVESTIGATION.md`):
-- After BidiAppend with tool results, Cursor stores responses in KV blobs instead of streaming
-- Assistant blobs may contain text OR tool calls (infinite loop observed)
-- `turn_ended` never fires in same-session continuation
-- Fresh sessions work reliably; session reuse requires more protocol understanding
+**Current Workaround** (implemented and working):
+- When tool results arrive, close old session and start fresh request
+- `messagesToPrompt()` formats full conversation history (including tool calls/results)
+- Server processes as new conversation with complete context
+- Works reliably but incurs ~3-6s bootstrap per continuation
 
-**Next steps**:
-- [ ] Investigate Cursor CLI headers that enable streaming after BidiAppend
-- [ ] Test with different Cursor client versions
-- [ ] Monitor if Cursor API behavior changes
-- [ ] Try `x-cursor-streaming: true` header variations
+**What Was Tried**:
+- [x] BidiAppend with tool results → Server only sends heartbeats
+- [x] ResumeAction after tool results → No effect
+- [x] Various header combinations → No change
+- [x] KV blob extraction → Works for response extraction, not continuation
 
-**Potential solutions**:
-1. **KV Blob Extraction** (implemented): Poll blob store after heartbeat timeout, extract and emit text
-2. **Header Matching**: Find correct headers that trigger streaming mode
-3. **Hybrid Approach**: Fresh sessions for tool calls, session reuse for simple chat
+**Why We Stopped Investigating**:
+- Fundamental API model mismatch cannot be bridged without protocol changes
+- Fresh-request-with-history approach works reliably
+- Time better spent on other improvements
+
+**Future Possibility**: Could become feasible if Cursor adds stateless tool result injection API or if we discover undocumented protocol elements.
+
+**Reference**: See `docs/SESSION_REUSE_IMPLEMENTATION.md` and `src/lib/session-reuse.ts` for full analysis.
 
 ### 5. MCP (Model Context Protocol) Support
 **Status**: Planned  
@@ -153,13 +157,13 @@ Session reuse via BidiAppend would significantly reduce latency by avoiding the 
 ## Research & Exploration
 
 ### Understanding Cursor's Architecture
-**Status**: Ongoing
+**Status**: Largely Complete
 
-Areas to investigate:
-- [ ] Why does BidiAppend cause KV blob storage instead of streaming?
-- [ ] What headers/flags trigger different response modes?
-- [ ] How does Cursor CLI handle multi-turn conversations?
-- [ ] What's the role of checkpoints in conversation state?
+Key findings documented in `docs/SESSION_REUSE_IMPLEMENTATION.md`:
+- [x] Why BidiAppend doesn't trigger continuation (API model mismatch)
+- [x] How Cursor CLI maintains continuous streams (not replicable with OpenAI compat)
+- [x] Role of KV blobs in response storage
+- [ ] Checkpoint role in conversation state (low priority)
 
 ### Native Cursor Provider for OpenCode
 **Status**: Exploratory  

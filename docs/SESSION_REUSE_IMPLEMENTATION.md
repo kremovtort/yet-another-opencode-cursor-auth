@@ -1,353 +1,185 @@
 # Session Reuse Implementation Guide
 
-**Date**: January 1, 2026  
-**Status**: Completed - Session reuse is now the default behavior
+**Date**: January 2, 2026  
+**Status**: ⚠️ Limited - True session reuse not possible due to API mismatch
 
-## Overview
+## Executive Summary
 
-This document outlines how session reuse is implemented in the Cursor proxy. Session reuse allows tool results to be sent back to an existing Cursor session via `BidiAppend` instead of creating a new session for each request.
+**True session reuse across OpenAI API requests is not possible** due to a fundamental architectural mismatch between OpenAI's request/response model and Cursor's bidirectional streaming protocol.
 
-## Current State
+### The Core Problem
 
-### How It Works (Default Behavior)
-- Tool results are sent via `BidiAppend` to continue the existing session
-- After sending tool results, `ResumeAction` is sent to signal the server to continue streaming
-- The server resumes streaming text instead of storing responses in KV blobs
-- **Advantage**: More efficient, maintains conversation context natively
+| Aspect | OpenAI API | Cursor Bidirectional |
+|--------|------------|---------------------|
+| Model | Request → Response (HTTP) | Continuous stream |
+| Tool calls | Response ends, new request with results | Stream stays open, results sent inline |
+| Context | Full history in each request | Server maintains context |
+
+When Cursor's model requests a tool call, the OpenAI API **must close the HTTP response** to return `tool_calls` to the client. The client then sends a **new HTTP request** with tool results. This breaks the continuous streaming context that Cursor's `bidiAppend` relies on.
+
+### What Works
+
+Tool call continuation works via a **workaround**: when tool results arrive, we close any existing session and start a completely fresh request with the full conversation history (including prior tool calls and results) formatted via `messagesToPrompt()`.
+
+### What Doesn't Work
+
+- **True session reuse**: Keeping a single bidirectional stream open across multiple OpenAI API requests
+- **BidiAppend tool results**: Server acknowledges receipt but doesn't continue generating
+
+## Current Implementation
+
+### Behavior (Default: `CURSOR_SESSION_REUSE=1`)
+
+1. **First request**: Creates new Cursor session, streams response
+2. **Tool call emitted**: Session saved with `pendingExecs`, HTTP response closes with `tool_calls`
+3. **Follow-up request with tool results**: 
+   - Detects tool messages in request
+   - **Closes old session** (not reused)
+   - Creates **fresh session** with full history via `messagesToPrompt()`
+   - Server processes as new conversation with context
+
+### Why This Works
+
+The `messagesToPrompt()` function in `src/lib/openai-compat/utils.ts` formats the full conversation including:
+- System messages
+- User messages  
+- Assistant messages (including `tool_calls`)
+- Tool result messages
+
+The Cursor server receives this as a complete conversation context and continues appropriately.
 
 ### Disabling Session Reuse
-To disable session reuse and fall back to fresh sessions per request:
+
 ```bash
 CURSOR_SESSION_REUSE=0 bun run src/server.ts
 ```
 
-When disabled:
-- Each OpenCode request creates a new Cursor session
-- Full conversation history is sent in every request
-- Tool calls are emitted as OpenAI `tool_calls`, OpenCode executes them locally
-- Follow-up requests include tool results in message history
+When disabled, the simpler non-session-reuse code path is used (no `sessionMap`, no session tracking).
 
-## Recent Progress (January 2026)
+## Investigation History
 
-### ResumeAction Discovery
+### What We Tried
 
-Analysis of `cursor-agent-restored-source-code/agent-client/dist/connect.js` (lines 486-497) revealed that after sending tool results, the Cursor CLI sends a `ConversationAction` with `resumeAction` to signal the server to continue:
+1. **BidiAppend with tool results**: Sent tool results via `bidiAppend` to existing stream
+   - Server acknowledged with `tool_call_completed`
+   - Server sent only heartbeats afterward, no text continuation
 
-```javascript
-const resumeActionMessage = new agent_pb.ConversationAction({
-  action: {
-    case: "resumeAction",
-    value: new agent_pb.ResumeAction()
-  }
-});
+2. **ResumeAction after tool results**: Sent `ConversationAction.resumeAction` per Cursor CLI pattern
+   - No effect on server behavior
+
+3. **Various header combinations**: Tried different `x-cursor-*` headers
+   - No change in behavior
+
+### Why True Session Reuse Fails
+
+The Cursor CLI maintains a **continuous bidirectional stream**:
+```
+[CLI] → bidiStart → [Server]
+[CLI] ← streaming response ← [Server]
+[CLI] → tool result via bidiAppend → [Server]
+[CLI] ← continued streaming ← [Server]  ← This happens because stream never closed
 ```
 
-### Implementation Completed
-
-1. **Unit Tests** (`tests/unit/bidi-encoding.test.ts`):
-   - Tests for `encodeBidiRequestId()`
-   - Tests for `encodeBidiAppendRequest()`
-   - Tests for `encodeResumeAction()`, `encodeConversationActionWithResume()`, `encodeAgentClientMessageWithConversationAction()`
-
-2. **Proto Encoding** (`src/lib/api/proto/agent-messages.ts`):
-   - `encodeResumeAction()` - encodes empty ResumeAction message
-   - `encodeConversationActionWithResume()` - wraps ResumeAction in ConversationAction field 2
-   - `encodeAgentClientMessageWithConversationAction()` - wraps in AgentClientMessage field 4
-
-3. **AgentServiceClient** (`src/lib/api/agent-service.ts`):
-   - Added `sendResumeAction()` method to send ResumeAction after tool results
-
-### Proto Structure Reference
-
+Our OpenAI-compat layer must:
 ```
-AgentClientMessage (to server):
-  field 1: run_request (AgentRunRequest) - initial request
-  field 2: exec_client_message (ExecClientMessage) - tool results
-  field 4: conversation_action (ConversationAction) - actions like resume
-
-ConversationAction:
-  field 1: user_message_action (UserMessageAction) - for new user messages
-  field 2: resume_action (ResumeAction) - signal to continue after tool results
-
-ResumeAction:
-  (empty message - presence signals resume)
+[Client] → POST /chat/completions → [Proxy]
+[Proxy] → bidiStart → [Server]
+[Proxy] ← streaming → [Server]
+[Proxy] → SSE with tool_calls → [Client]
+[Client] → NEW POST with results → [Proxy]  ← New HTTP request!
+[Proxy] → bidiAppend to old stream → [Server]
+[Server] → heartbeat only, no text ← [Server]  ← Stream context lost
 ```
 
-### Expected Wire Format
+The fundamental issue: **closing the HTTP response to return tool_calls breaks the streaming context**.
 
-For a ResumeAction message:
-```
-AgentClientMessage { conversation_action: ConversationAction { resume_action: ResumeAction {} } }
-Hex: 22 02 12 00
-  22 = field 4, wire type 2 (AgentClientMessage.conversation_action)
-  02 = length 2
-  12 = field 2, wire type 2 (ConversationAction.resume_action)
-  00 = length 0 (empty ResumeAction)
-```
+## Code Structure
 
-## Cursor CLI Architecture Reference
-
-### Key Source Files
+### Key Files
 
 | File | Purpose |
 |------|---------|
-| `agent-client/dist/connect.js:162-222` | Stream splitting (interaction, exec, checkpoint, kv) |
-| `agent-client/dist/connect.js:281-548` | Main session run loop |
-| `agent-kv/dist/controlled.js:122-226` | KV blob get/set handling |
-| `agent-kv/dist/agent-store.js:102-182` | Conversation reconstruction from blobs |
-| `proto/dist/generated/agent/v1/kv_pb.js` | KV message protocol definitions |
-| `proto/dist/generated/agent/v1/agent_pb.js` | InteractionUpdate, ConversationState |
-| `bidi-connect/dist/index.js:68-169` | BidiAppend transport layer |
+| `src/lib/session-reuse.ts` | Session utilities, type definitions, architectural docs |
+| `src/lib/openai-compat/handler.ts` | Main request handler with session logic |
+| `src/lib/openai-compat/utils.ts` | `messagesToPrompt()` for history formatting |
+| `src/lib/api/agent-service.ts` | Cursor API client with `bidiAppend`, `sendToolResult`, etc. |
 
-### Stream Architecture
-
-The Cursor CLI splits the incoming `AgentServerMessage` stream into 4 sub-streams:
-
-```
-AgentServerMessage
-├── interactionStream  → UI updates (text_delta, tool_call_started, etc.)
-├── execStream         → Tool execution requests (ExecServerMessage)  
-├── checkpointStream   → Conversation state checkpoints
-└── kvStream           → KV blob operations (get/set)
-```
-
-**Reference**: `connect.js:162-222`
-
-```javascript
-function splitStream(stream, detector) {
-  const interactionStream = createWritableIterable();
-  const execStream = createWritableIterable();
-  const checkpointStream = createWritableIterable();
-  const kvStream = createWritableIterable();
-  
-  for await (const message of stream) {
-    if (message.message.case === "interactionUpdate" || 
-        message.message.case === "interactionQuery") {
-      interactionStream.write(message.message);
-    }
-    if (message.message.case === "execServerMessage" || 
-        message.message.case === "execServerControlMessage") {
-      execStream.write(message.message.value);
-    }
-    if (message.message.case === "conversationCheckpointUpdate") {
-      checkpointStream.write(message.message.value);
-    }
-    if (message.message.case === "kvServerMessage") {
-      kvStream.write(message.message.value);
-    }
-  }
-}
-```
-
-### KV Blob Protocol
-
-**Messages** (`kv_pb.js`):
-
-| Message | Fields | Purpose |
-|---------|--------|---------|
-| `KvServerMessage` | `id`, `get_blob_args` OR `set_blob_args` | Server requests blob get/set |
-| `KvClientMessage` | `id`, `get_blob_result` OR `set_blob_result` | Client responds |
-| `GetBlobArgs` | `blob_id` (bytes) | Request to fetch blob |
-| `GetBlobResult` | `blob_data` (bytes, optional) | Blob content or empty |
-| `SetBlobArgs` | `blob_id`, `blob_data` (bytes) | Store blob |
-| `SetBlobResult` | `error` (optional) | Confirmation or error |
-
-**Blob ID Generation**: SHA-256 hash of blob content (`blob-store.js:28-32`)
-
-**Reference**: `controlled.js:146-201`
-
-```javascript
-// ControlledKvManager handles KV requests
-switch (message.message.case) {
-  case "getBlobArgs":
-    const response = await blobStore.getBlob(ctx, message.message.value.blobId);
-    await clientStream.write(new KvClientMessage({
-      id: message.id,
-      message: {
-        case: "getBlobResult",
-        value: { blobData: response ? new Uint8Array(response) : undefined }
-      }
-    }));
-    break;
-    
-  case "setBlobArgs":
-    await blobStore.setBlob(ctx, message.message.value.blobId, message.message.value.blobData);
-    await clientStream.write(new KvClientMessage({
-      id: message.id,
-      message: { case: "setBlobResult", value: { error: undefined } }
-    }));
-    break;
-}
-```
-
-### InteractionUpdate Message Types
-
-**Reference**: `agent_pb.js` InteractionUpdate.fields
-
-| Field # | Name | Type | Description |
-|---------|------|------|-------------|
-| 1 | `text_delta` | TextDeltaUpdate | Streamed text content |
-| 2 | `tool_call_started` | ToolCallStartedUpdate | Tool call begins |
-| 3 | `tool_call_completed` | ToolCallCompletedUpdate | Tool call ends |
-| 4 | `thinking_delta` | ThinkingDeltaUpdate | Thinking/reasoning text |
-| 5 | `thinking_completed` | ThinkingCompletedUpdate | Thinking ends |
-| 6 | `user_message_appended` | UserMessageAppendedUpdate | User message added |
-| 7 | `partial_tool_call` | PartialToolCallUpdate | Tool call args streaming |
-| 8 | `token_delta` | TokenDeltaUpdate | Token count update |
-| 14 | `turn_ended` | (empty) | Turn complete signal |
-| 15 | `tool_call_delta` | ToolCallDeltaUpdate | Tool call update |
-
-### Conversation State Storage
-
-**Reference**: `agent-store.js:102-182`
-
-Conversation turns are stored as blob IDs in `ConversationStateStructure.turns`. To reconstruct:
-
-```javascript
-async getFullConversation(ctx) {
-  const turns = [];
-  for (const turnBlobId of this.conversationStateStructure.turns) {
-    const turnBlob = await blobStore.getBlob(ctx, turnBlobId);
-    const turnStructure = deserialize(turnBlob);
-    
-    switch (turnStructure.turn.case) {
-      case "agentConversationTurn":
-        // Fetch userMessage blob, steps blobs
-        const userMessageBlob = await blobStore.getBlob(ctx, turnStructure.turn.value.userMessage);
-        // ... reconstruct turn
-        break;
-      case "shellConversationTurn":
-        // Fetch shellCommand, shellOutput blobs
-        break;
-    }
-    turns.push(conversationTurn);
-  }
-  return { turns, todos, summary };
-}
-```
-
-### Tool Result Sending
-
-**Reference**: `agent-client/dist/exec-controller.js:116-243`, `connect.js:402-420`
-
-Tool results are wrapped in `AgentClientMessage`:
-
-```javascript
-// ExecClientMessage structure
-{
-  id: number,           // Matches ExecServerMessage.id
-  exec_id: string,      // Matches ExecServerMessage.exec_id
-  message: {
-    case: "shellResult" | "writeResult" | "readResult" | "grepResult" | ...,
-    value: { ... result data ... }
-  }
-}
-
-// Wrapped in AgentClientMessage
-{
-  message: {
-    case: "execClientMessage",
-    value: ExecClientMessage
-  }
-}
-```
-
-## Implementation Plan
-
-### Phase 1: Environment Flag
-
-Add `CURSOR_SESSION_REUSE=1` environment variable to enable experimental session reuse.
+### Session Flow (Simplified)
 
 ```typescript
-const SESSION_REUSE_ENABLED = process.env.CURSOR_SESSION_REUSE === "1";
-```
+// handler.ts - streamChatCompletionWithSessionReuse()
 
-### Phase 2: Proper KV Blob Handling
+// 1. Check for existing session
+const existingSessionId = findSessionIdInMessages(messages);
+const toolMessages = collectToolMessages(messages);
 
-Currently we handle `set_blob_args` by storing blobs and responding. We need to:
+// 2. If tool results present AND session exists → close old, start fresh
+if (toolMessages.length > 0 && session) {
+  await session.iterator.return?.();
+  sessionMap.delete(sessionId);
+  session = undefined;
+  sessionId = createSessionId();
+}
 
-1. **Track assistant response blobs**: When `set_blob_args` contains JSON with `role: "assistant"`, save the blob ID
-2. **Detect KV-stored responses**: If stream ends without `text_delta` but we have assistant blob, extract text
-3. **Emit extracted text**: Convert blob content to OpenAI stream chunks
-
-```typescript
-// Detect assistant response in blob
-if (kvMsg.messageType === 'set_blob_args' && kvMsg.blobData) {
-  try {
-    const text = new TextDecoder().decode(kvMsg.blobData);
-    const json = JSON.parse(text);
-    if (json.role === "assistant" && json.content) {
-      // Store for later extraction
-      pendingAssistantBlob = { blobId: kvMsg.blobId, content: json.content };
-    }
-  } catch {}
+// 3. Create new session with full history
+if (!session) {
+  const iterator = client.chatStream({ 
+    message: prompt,  // Full history via messagesToPrompt()
+    model, 
+    tools 
+  });
+  session = { id: sessionId, iterator, ... };
 }
 ```
 
-### Phase 3: Turn End Detection
+## Retained Infrastructure
 
-The Cursor CLI expects `turn_ended` (field 14) to signal completion. If we receive this after tool execution without streamed text, check for KV-stored response.
+The following are retained but not actively used for cross-request session reuse:
 
-```typescript
-if (chunk.type === "turn_ended") {
-  if (!hasStreamedText && pendingAssistantBlob) {
-    // Emit the KV-stored response as streamed chunks
-    emitTextFromBlob(pendingAssistantBlob.content);
-  }
-  // Emit finish_reason: "stop"
-}
+| Component | Why Retained |
+|-----------|--------------|
+| `sessionMap` | Internal read handling during edit flows |
+| `pendingExecs` | Potential future improvements |
+| `makeToolCallId()` | Tool call ID generation with session encoding |
+| `sendToolResultsToCursor()` | Reference implementation, tested |
+
+## Performance Implications
+
+### Current (Fresh Request) Approach
+- **Latency**: ~3-6s bootstrap per request (SSE connection setup)
+- **Tokens**: Full history sent each request (higher token usage)
+- **Reliability**: High - each request is independent
+
+### Theoretical True Session Reuse (Not Achievable)
+- **Latency**: ~100-500ms for continuation (bidiAppend only)
+- **Tokens**: Incremental (lower token usage)
+- **Reliability**: Would require maintaining long-lived streams
+
+## Testing
+
+```bash
+# Run all tests
+bun test
+
+# Run session-reuse specific tests
+bun test tests/unit/session-reuse.test.ts
+
+# Test harness for tool call flows
+bun run scripts/session-reuse-harness.ts
 ```
 
-### Phase 4: Edit Flow in Session Context
+## Future Possibilities
 
-Apply the same edit flow fix (internal read handling) to the session-based code path:
+True session reuse might become possible if:
 
-```typescript
-// In streamCursorSession()
-if (chunk.type === "tool_call_started" && chunk.toolCall) {
-  if (chunk.toolCall.name === "edit" || chunk.toolCall.name === "apply_diff") {
-    pendingEditToolCall = chunk.toolCall.callId;
-  }
-}
+1. **Cursor changes their API** to support stateless tool result injection
+2. **We discover missing protocol elements** that enable continuation
+3. **Alternative transport** (WebSocket with custom framing) is implemented
 
-// When processing exec_request
-if (execReq.type === "read" && pendingEditToolCall) {
-  // Execute read locally, send result via BidiAppend
-  await client.sendReadResult(...);
-  continue; // Don't emit to OpenCode
-}
-```
-
-## Known Issues & Unknowns
-
-### Why KV Blobs Instead of Streaming?
-
-Hypothesis: The Cursor server may use different response modes based on:
-1. **Client headers**: `x-cursor-client-version`, `x-cursor-client-type`
-2. **Request context**: Some flag in the BidiAppend that signals "CLI mode"
-3. **Session state**: First request streams, continuations use KV
-
-### Missing Protocol Details
-
-1. How does `turn_ended` relate to text being in KV vs streamed?
-2. Is there a `response_mode` field we're missing?
-3. Does the checkpoint contain hints about where response is stored?
-
-## Testing Strategy
-
-1. **Default (session reuse enabled)**: `bun run src/server.ts`
-2. **With debug logging**: `CURSOR_DEBUG=1 bun run src/server.ts`
-3. **Disable session reuse**: `CURSOR_SESSION_REUSE=0 bun run src/server.ts`
-
-## Next Steps
-
-- Monitor for any edge cases with complex multi-tool workflows
-- Consider adding metrics for session reuse vs fresh session performance
+For now, the fresh-request-with-history approach is reliable and functional.
 
 ## References
 
 - Cursor CLI source: `cursor-agent-restored-source-code/`
-- Our implementation: `src/server.ts`, `src/lib/api/agent-service.ts`
-- KV handling: `src/lib/api/agent-service.ts:handleKvMessage()`
-- ResumeAction encoding: `src/lib/api/proto/agent-messages.ts`
-- Unit tests: `tests/unit/bidi-encoding.test.ts`
+- Session utilities: `src/lib/session-reuse.ts` (includes detailed architectural comment)
+- Test harness: `scripts/session-reuse-harness.ts`
