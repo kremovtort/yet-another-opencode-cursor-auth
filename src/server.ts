@@ -1,14 +1,14 @@
 /**
  * OpenAI-Compatible API Server
- * 
+ *
  * Routes OpenAI API requests through Cursor's Agent API backend.
  * Supports:
  * - POST /v1/chat/completions (streaming and non-streaming)
  * - GET /v1/models
- * 
+ *
  * Usage:
  *   CURSOR_ACCESS_TOKEN=<token> bun run src/server.ts
- *   
+ *
  * Or with auto-loaded credentials:
  *   bun run src/server.ts
  */
@@ -32,7 +32,7 @@ async function getAccessToken(): Promise<string> {
   if (envToken) {
     return envToken;
   }
-  
+
   // Fall back to credential manager
   const cm = new FileCredentialManager("cursor");
   const token = await cm.getAccessToken();
@@ -64,10 +64,10 @@ const handleRequest = createRequestHandler({
 Bun.serve({
   port: PORT,
   idleTimeout: 120, // 2 minutes to allow for long tool executions
-  
+
   async fetch(req) {
     const url = new URL(req.url);
-    
+
     // Enhanced health check with version info (server-specific)
     if (url.pathname === "/health" || url.pathname === "/") {
       return new Response(JSON.stringify({ status: "ok", version: "1.0.0" }), {
@@ -77,7 +77,7 @@ Bun.serve({
         },
       });
     }
-    
+
     // Delegate to shared request handler
     return handleRequest(req);
   },
@@ -95,7 +95,7 @@ debugLog(`
 ║    GET  /health               - Health check               ║
 ║                                                            ║
 ║  Usage with curl:                                          ║
-║    curl http://localhost:${PORT}/v1/chat/completions \${" ".repeat(Math.max(0, 6 - PORT.toString().length))}║
+║    curl http://localhost:${PORT}/v1/chat/completions ${" ".repeat(Math.max(0, 6 - PORT.toString().length))}║
 ║      -H "Content-Type: application/json" \                 ║
 ║      -d '{"model":"gpt-4o","messages":[...]}'              ║
 ║                                                            ║
