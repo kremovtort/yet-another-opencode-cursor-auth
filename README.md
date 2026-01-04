@@ -44,8 +44,8 @@ Since the npm package isn't published yet, clone and link locally:
 
 ```bash
 # Clone the repository
-git clone https://github.com/Yukaii/opencode-cursor-auth.git
-cd opencode-cursor-auth
+git clone https://github.com/Yukaii/yet-another-opencode-cursor-auth.git
+cd yet-another-opencode-cursor-auth
 bun install
 
 # Link for local development
@@ -65,7 +65,7 @@ Add directly from GitHub in your `package.json`:
 ```json
 {
   "dependencies": {
-    "yet-another-opencode-cursor-auth": "github:Yukaii/opencode-cursor-auth"
+    "yet-another-opencode-cursor-auth": "github:Yukaii/yet-another-opencode-cursor-auth"
   }
 }
 ```
@@ -164,8 +164,8 @@ For development, testing, or use with other OpenAI-compatible clients, a standal
 
 ```bash
 # Clone and install
-git clone https://github.com/Yukaii/opencode-cursor-auth.git
-cd opencode-cursor-auth
+git clone https://github.com/Yukaii/yet-another-opencode-cursor-auth.git
+cd yet-another-opencode-cursor-auth
 bun install
 
 # Authenticate first
@@ -241,7 +241,7 @@ for await (const chunk of response) {
 ## Project Structure
 
 ```
-opencode-cursor-auth/
+yet-another-opencode-cursor-auth/
 ├── src/
 │   ├── server.ts              # Standalone proxy server (dev artifact)
 │   ├── index.ts               # Plugin exports

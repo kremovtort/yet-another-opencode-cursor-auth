@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Yukaii/opencode-cursor-auth"
+    "url": "https://github.com/Yukaii/yet-another-opencode-cursor-auth"
   },
   "module": "dist/index.js",
   "main": "dist/index.js",
