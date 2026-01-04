@@ -33,7 +33,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
@@ -41,6 +41,9 @@ jobs:
 
       - name: Build package
         run: bun run build
+
+      - name: Show npm version
+        run: npm --version
 
       - name: Create prerelease version
         run: |
@@ -54,8 +57,6 @@ jobs:
 
       - name: Publish to npm (prerelease)
         run: npm publish --provenance --access public --tag dev
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-release:
     if: github.event_name == 'release'
@@ -75,7 +76,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
@@ -84,10 +85,11 @@ jobs:
       - name: Build package
         run: bun run build
 
+      - name: Show npm version
+        run: npm --version
+
       - name: Verify package contents
         run: npm pack --dry-run
 
       - name: Publish to npm
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
