@@ -551,7 +551,7 @@ export class AgentServiceClient {
       throw new Error("No active chat stream - cannot send resume action");
     }
 
-    console.log("[DEBUG] sendResumeAction called:", {
+    debugLog("[DEBUG] sendResumeAction called:", {
       requestId: this.currentRequestId,
       currentSeqno: String(this.currentAppendSeqno),
     });
@@ -559,11 +559,11 @@ export class AgentServiceClient {
     const conversationAction = encodeConversationActionWithResume();
     const agentClientMessage = encodeAgentClientMessageWithConversationAction(conversationAction);
 
-    console.log("[DEBUG] Sending ResumeAction with bidiAppend...");
+    debugLog("[DEBUG] Sending ResumeAction with bidiAppend...");
     await this.bidiAppend(this.currentRequestId, this.currentAppendSeqno, agentClientMessage);
     this.currentAppendSeqno++;
 
-    console.log("[DEBUG] ResumeAction sent successfully, new seqno:", String(this.currentAppendSeqno));
+    debugLog("[DEBUG] ResumeAction sent successfully, new seqno:", String(this.currentAppendSeqno));
   }
 
   /**
