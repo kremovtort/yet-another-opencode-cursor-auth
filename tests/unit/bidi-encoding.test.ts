@@ -108,14 +108,15 @@ describe("encoding primitives", () => {
 });
 
 describe("google.protobuf.Value encoding", () => {
-  test("encodes null as empty (NullValue = 0 is omitted per protobuf convention)", () => {
+  test("encodes null as a oneof field presence (null_value=0)", () => {
     const result = encodeProtobufValue(null);
-    expect(result.length).toBe(0);
+    // Field 1 (null_value), wire type 0 -> tag = 0x08, value = 0x00
+    expect(result).toEqual(new Uint8Array([0x08, 0x00]));
   });
 
-  test("encodes undefined as empty (same as null)", () => {
+  test("encodes undefined as a oneof field presence (same as null)", () => {
     const result = encodeProtobufValue(undefined);
-    expect(result.length).toBe(0);
+    expect(result).toEqual(new Uint8Array([0x08, 0x00]));
   });
 
   test("encodes number as double", () => {
@@ -131,6 +132,12 @@ describe("google.protobuf.Value encoding", () => {
     expect(result[0]).toBe(0x1a); // (3 << 3) | 2
     expect(result[1]).toBe(4); // length
     expect(result.slice(2)).toEqual(new TextEncoder().encode("test"));
+  });
+
+  test("encodes empty string with oneof presence (string_value=\"\")", () => {
+    // Field 3 (string_value), wire type 2 -> tag = 0x1a, length = 0
+    const result = encodeProtobufValue("");
+    expect(result).toEqual(new Uint8Array([0x1a, 0x00]));
   });
 
   test("encodes boolean", () => {

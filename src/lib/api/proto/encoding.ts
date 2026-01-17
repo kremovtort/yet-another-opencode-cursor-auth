@@ -154,9 +154,35 @@ export function concatBytes(...arrays: Uint8Array[]): Uint8Array {
  *   field 6: list_value (ListValue)
  */
 export function encodeProtobufValue(value: unknown): Uint8Array {
+  const DEBUG_PROTO_VALUE = process.env.CURSOR_DEBUG_PROTO_VALUE === "1";
+
+  // IMPORTANT:
+  // google.protobuf.Value uses a `oneof` for its content. Even if the chosen
+  // scalar value is the proto3 default (e.g. null_value=0 or string_value=""),
+  // we MUST still emit the field tag to establish oneof presence.
+  //
+  // If we accidentally encode to an empty byte array, the server sees Value{} and
+  // can reject with: "google.protobuf.Value must have a value (grpc-status 13)".
+  const encodeOneofUint32AllowZero = (fieldNumber: number, v: number): Uint8Array => {
+    const fieldTag = (fieldNumber << 3) | 0; // varint
+    return concatBytes(new Uint8Array([fieldTag]), encodeVarint(v));
+  };
+  const encodeOneofStringAllowEmpty = (fieldNumber: number, v: string): Uint8Array => {
+    const fieldTag = (fieldNumber << 3) | 2; // length-delimited
+    const encoded = new TextEncoder().encode(v);
+    const length = encodeVarint(encoded.length);
+    return concatBytes(new Uint8Array([fieldTag]), length, encoded);
+  };
+
   if (value === null || value === undefined) {
     // NullValue enum = 0
-    return encodeUint32Field(1, 0);
+    const encoded = encodeOneofUint32AllowZero(1, 0);
+    if (DEBUG_PROTO_VALUE && encoded.length === 0) {
+      console.warn(
+        "[DEBUG] encodeProtobufValue(null|undefined) produced an empty Value message (unexpected)."
+      );
+    }
+    return encoded;
   }
 
   if (typeof value === "number") {
@@ -164,7 +190,13 @@ export function encodeProtobufValue(value: unknown): Uint8Array {
   }
 
   if (typeof value === "string") {
-    return encodeStringField(3, value);
+    const encoded = encodeOneofStringAllowEmpty(3, value);
+    if (DEBUG_PROTO_VALUE && encoded.length === 0) {
+      console.warn(
+        "[DEBUG] encodeProtobufValue(string) produced an empty Value message (unexpected)."
+      );
+    }
+    return encoded;
   }
 
   if (typeof value === "boolean") {

@@ -3,6 +3,7 @@
   "provider": {
     "cursor": {
       "name": "Cursor",
+      "api": "https://cursor.opencode.local/v1"
     }
   }
 }

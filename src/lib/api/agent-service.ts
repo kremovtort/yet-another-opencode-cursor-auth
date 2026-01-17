@@ -94,6 +94,23 @@ const debugLog = DEBUG ? console.log.bind(console) : () => {};
 const TIMING_ENABLED = process.env.CURSOR_TIMING === "1" || DEBUG;
 const timingLog = TIMING_ENABLED ? console.log.bind(console) : () => {};
 
+// Redacted request/response shape logging (never print tokens/checksums).
+const REDACTED_DEBUG = process.env.CURSOR_DEBUG_REDACTED === "1";
+function redactHeaderValue(key: string, value: string): string {
+  const k = key.toLowerCase();
+  if (k === "authorization") return "Bearer <redacted>";
+  if (k === "x-cursor-checksum") return "<redacted>";
+  return value;
+}
+function debugHeaders(label: string, headers: Record<string, string>): void {
+  if (!DEBUG || !REDACTED_DEBUG) return;
+  const sanitized: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    sanitized[k] = redactHeaderValue(k, v);
+  }
+  debugLog(`[DEBUG] ${label} headers:`, sanitized);
+}
+
 
 function createTimingMetrics(): ChatTimingMetrics {
   return {
@@ -294,6 +311,7 @@ export class AgentServiceClient {
       headers["x-request-id"] = requestId;
     }
 
+    debugHeaders("cursor", headers);
     return headers;
   }
 
@@ -370,6 +388,11 @@ export class AgentServiceClient {
     debugLog(`[TIMING] bidiAppend: data=${data.length}bytes, hex=${hexData.length}chars, envelope=${envelope.length}bytes, encode=${Date.now() - startTime}ms`);
 
     const url = `${this.baseUrl}/aiserver.v1.BidiService/BidiAppend`;
+    if (DEBUG && REDACTED_DEBUG) {
+      debugLog(
+        `[DEBUG] BidiAppend url=${url} seqno=${appendSeqno.toString()} dataBytes=${data.length} envelopeBytes=${envelope.length}`
+      );
+    }
 
     const fetchStart = Date.now();
     const response = await fetch(url, {
@@ -799,6 +822,11 @@ export class AgentServiceClient {
     const timeout = setTimeout(() => controller.abort(), 120000);
 
     try {
+      if (DEBUG && REDACTED_DEBUG) {
+        debugLog(
+          `[DEBUG] RunSSE url=${sseUrl} messageBytes=${messageBody.length} bidiRequestIdEnvelopeBytes=${envelope.length}`
+        );
+      }
       const ssePromise = fetch(sseUrl, {
         method: "POST",
         headers: this.getHeaders(requestId),

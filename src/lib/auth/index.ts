@@ -15,6 +15,9 @@ export {
   clearCredentials,
 } from "./helpers";
 
+// Re-export macOS Keychain helpers
+export { readCursorCliAccessTokenFromKeychain } from "./keychain";
+
 // Re-export login manager and related
 export {
   LoginManager,

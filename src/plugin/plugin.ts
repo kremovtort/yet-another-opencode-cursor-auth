@@ -16,6 +16,7 @@ import {
   LoginManager,
   CURSOR_API_BASE_URL,
 } from "../lib/auth/login";
+import { readCursorCliAccessTokenFromKeychain } from "../lib/auth";
 import { CursorClient } from "../lib/api/cursor-client";
 import { listCursorModels } from "../lib/api/cursor-models";
 import { decodeJwtPayload } from "../lib/utils/jwt";
@@ -55,7 +56,9 @@ const CURSOR_TO_LLM_INFO_MAP: Record<string, string> = {
   "grok": "grok-4",
 };
 
-const DEFAULT_LIMITS = { context: 128000, output: 16384 };
+// Conservative fallback limits for unknown models.
+// We intentionally err on the low side to avoid OpenCode attempting requests that exceed backend limits.
+const DEFAULT_LIMITS = { context: 32768, output: 8192 };
 
 function getModelLimits(cursorModelId: string): { context: number; output: number } {
   const llmInfoId = CURSOR_TO_LLM_INFO_MAP[cursorModelId];
@@ -208,142 +211,185 @@ export const CursorOAuthPlugin = async ({
       getAuth: GetAuth,
       providerArg: Provider
     ): Promise<LoaderResult | null> => {
-      // debugLog("[Cursor Plugin] Loader called");
-      // debugLog("[Cursor Plugin] providerArg:", providerArg);
-      const auth = await getAuth();
+      const buildLoaderResult = async (
+        accessToken: string,
+        provider: Provider
+      ): Promise<LoaderResult> => {
+        // Ensure provider and provider.models exist
+        provider.models = provider.models ?? {};
 
-      if (!isOAuthAuth(auth)) {
-        // debugLog("[Cursor Plugin] No OAuth auth found, returning null");
-        return null;
-      }
-
-      // debugLog("[Cursor Plugin] OAuth auth found, checking token expiry");
-
-      // Refresh token if needed
-      let authRecord = auth;
-      if (accessTokenExpired(authRecord)) {
-        // debugLog("[Cursor Plugin] Token expired, refreshing...");
-        const refreshed = await refreshCursorAccessToken(authRecord, client);
-        if (refreshed) {
-          authRecord = refreshed;
-          // debugLog("[Cursor Plugin] Token refreshed successfully");
-        } else {
-          // debugLog("[Cursor Plugin] Token refresh failed");
-        }
-      }
-
-      const accessToken = authRecord.access;
-      if (!accessToken) {
-        // debugLog("[Cursor Plugin] No access token available");
-        return null;
-      }
-
-      // debugLog("[Cursor Plugin] Access token available");
-
-      // Ensure provider and provider.models exist
-      const provider = providerArg ?? ({} as Provider);
-      provider.models = provider.models ?? {};
-
-      // Set model costs to 0 (Cursor handles billing)
-      for (const model of Object.values(provider.models)) {
-        if (model) {
-          model.cost = { input: 0, output: 0 };
-        }
-      }
-
-      // Dynamically populate provider models from Cursor API if available.
-      try {
-        // debugLog("[Cursor Plugin] Fetching models from Cursor API...");
-        const cursorClient = new CursorClient(accessToken);
-        const models = await listCursorModels(cursorClient);
-        // debugLog("[Cursor Plugin] Fetched", models.length, "models from Cursor API");
-        if (models.length > 0) {
-          for (const m of models) {
-            // Determine if this is a "thinking" (reasoning) model
-            const isThinking =
-              m.modelId?.includes("thinking") ||
-              m.displayModelId?.includes("thinking") ||
-              m.displayName?.toLowerCase().includes("thinking");
-
-            // Use displayModelId as the primary ID (user-facing), fall back to modelId
-            const modelID = m.displayModelId || m.modelId;
-            if (!modelID) continue;
-
-            const existingModel = provider.models[modelID];
-            const limits = getModelLimits(modelID);
-            
-            const parsedModel = {
-              id: modelID,
-              api: {
-                id: modelID,
-                npm: "@ai-sdk/openai-compatible",
-                url: undefined,
-              },
-              status: "active" as const,
-              name: m.displayName || m.displayNameShort || modelID,
-              providerID: CURSOR_PROVIDER_ID,
-              capabilities: {
-                temperature: true,
-                reasoning: isThinking,
-                attachment: true,
-                toolcall: true,
-                input: {
-                  text: true,
-                  audio: false,
-                  image: true,
-                  video: false,
-                  pdf: false,
-                },
-                output: {
-                  text: true,
-                  audio: false,
-                  image: false,
-                  video: false,
-                  pdf: false,
-                },
-                interleaved: false,
-              },
-              cost: {
-                input: 0,
-                output: 0,
-                cache: {
-                  read: 0,
-                  write: 0,
-                },
-              },
-              options: {},
-              limit: limits,
-              headers: {},
-              ...existingModel,
-            };
-            
-            provider.models[modelID] = parsedModel;
+        // Set model costs to 0 (Cursor handles billing)
+        for (const model of Object.values(provider.models)) {
+          if (model) {
+            model.cost = { input: 0, output: 0 };
           }
         }
-      } catch (error) {
-        // Silently continue with defaults if model listing fails
+
+        // Dynamically populate provider models from Cursor API if available.
+        try {
+          const cursorClient = new CursorClient(accessToken);
+          const models = await listCursorModels(cursorClient);
+          if (models.length > 0) {
+            for (const m of models) {
+              // Determine if this is a "thinking" (reasoning) model
+              const isThinking =
+                m.modelId?.includes("thinking") ||
+                m.displayModelId?.includes("thinking") ||
+                m.displayName?.toLowerCase().includes("thinking");
+
+              // Use displayModelId as the primary ID (user-facing), fall back to modelId
+              const modelID = m.displayModelId || m.modelId;
+              if (!modelID) continue;
+
+              const existingModel = provider.models[modelID];
+              const limits = getModelLimits(modelID);
+
+              const parsedModel = {
+                id: modelID,
+                api: {
+                  id: modelID,
+                  npm: "@ai-sdk/openai-compatible",
+                  url: undefined,
+                },
+                status: "active" as const,
+                name: m.displayName || m.displayNameShort || modelID,
+                providerID: CURSOR_PROVIDER_ID,
+                capabilities: {
+                  temperature: true,
+                  reasoning: isThinking,
+                  attachment: true,
+                  toolcall: true,
+                  input: {
+                    text: true,
+                    audio: false,
+                    image: true,
+                    video: false,
+                    pdf: false,
+                  },
+                  output: {
+                    text: true,
+                    audio: false,
+                    image: false,
+                    video: false,
+                    pdf: false,
+                  },
+                  interleaved: false,
+                },
+                cost: {
+                  input: 0,
+                  output: 0,
+                  cache: {
+                    read: 0,
+                    write: 0,
+                  },
+                },
+                options: {},
+                limit: limits,
+                headers: {},
+                ...existingModel,
+              };
+
+              provider.models[modelID] = parsedModel;
+            }
+          }
+        } catch {
+          // Silently continue with defaults if model listing fails
+        }
+
+        // Create custom fetch function instead of starting proxy server
+        const customFetch = createPluginFetch({
+          accessToken,
+          // Disable logging to avoid polluting the UI
+          log: () => {},
+        });
+
+        // We need to provide baseURL even when using custom fetch
+        // OpenCode uses baseURL to identify the provider/API for the model
+        // The actual URL doesn't matter since our fetch intercepts everything
+        return {
+          apiKey: "cursor-via-opencode", // Dummy key, not used
+          baseURL: "https://cursor.opencode.local/v1", // Virtual URL, intercepted by fetch
+          fetch: customFetch,
+        };
+      };
+
+      // --- Token resolution precedence (env > keychain > stored) ---
+
+      const envToken = process.env.CURSOR_ACCESS_TOKEN?.trim();
+      if (envToken) {
+        return await buildLoaderResult(envToken, providerArg ?? ({} as Provider));
       }
 
-      // Create custom fetch function instead of starting proxy server
-      const customFetch = createPluginFetch({
-        accessToken,
-        // Disable logging to avoid polluting the UI
-        log: () => {},
-      });
+      const keychainToken = await readCursorCliAccessTokenFromKeychain();
+      if (keychainToken) {
+        return await buildLoaderResult(
+          keychainToken,
+          providerArg ?? ({} as Provider)
+        );
+      }
 
-      // We need to provide baseURL even when using custom fetch
-      // OpenCode uses baseURL to identify the provider/API for the model
-      // The actual URL doesn't matter since our fetch intercepts everything
-      const result = {
-        apiKey: "cursor-via-opencode", // Dummy key, not used
-        baseURL: "https://cursor.opencode.local/v1", // Virtual URL, intercepted by fetch
-        fetch: customFetch,
-      };
-      // debugLog("[Cursor Plugin] Returning:", { apiKey: result.apiKey, baseURL: result.baseURL, hasFetch: !!result.fetch });
-      return result;
+      // Fall back to stored provider auth (OAuth-style) if present and usable.
+      const auth = await getAuth();
+      if (!isOAuthAuth(auth)) {
+        return null;
+      }
+
+      let authRecord = auth;
+      if (accessTokenExpired(authRecord)) {
+        const refreshed = await refreshCursorAccessToken(authRecord, client);
+        if (refreshed) authRecord = refreshed;
+      }
+
+      const storedToken = authRecord.access;
+      if (!storedToken) return null;
+
+      return await buildLoaderResult(
+        storedToken,
+        providerArg ?? ({} as Provider)
+      );
     },
 
     methods: [
+      {
+        label: "Cursor CLI (macOS Keychain)",
+        type: "oauth",
+        authorize: async () => {
+          return {
+            // OpenCode requires a URL for OAuth methods; we don't depend on it for this flow.
+            url: "https://cursor.com",
+            instructions:
+              "This method reads your Cursor CLI token from macOS Keychain.\n\n" +
+              "1) Install Cursor CLI and sign in (e.g. `cursor login`).\n" +
+              "2) Then return here and continue.\n\n" +
+              "No secrets will be printed.",
+            method: "auto",
+            callback: async (): Promise<TokenExchangeResult> => {
+              const token = await readCursorCliAccessTokenFromKeychain();
+              if (!token) {
+                return {
+                  type: "failed",
+                  error:
+                    "Could not read Cursor CLI token from macOS Keychain. Make sure Cursor CLI is installed and you are logged in, then try again.",
+                };
+              }
+
+              // Derive expiration from JWT payload when possible; otherwise use a conservative default.
+              let expires = Date.now() + 30 * 60 * 1000; // 30 minutes default
+              const payload = decodeJwtPayload(token);
+              if (payload?.exp && typeof payload.exp === "number") {
+                expires = payload.exp * 1000;
+              }
+
+              return {
+                type: "success",
+                refresh: "",
+                access: token,
+                expires,
+              };
+            },
+          };
+        },
+      },
       {
         label: "OAuth with Cursor",
         type: "oauth",
